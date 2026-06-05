@@ -61,14 +61,52 @@ export type DaemonCrashHandler = (sessionId: string) => void;
 const __dir = dirname(fileURLToPath(import.meta.url));
 
 /**
+ * Whether this module is being run from TypeScript source (via tsx) rather
+ * than a compiled dist.
+ *
+ * True when the import.meta.url ends with ".ts" (tsx loader presents the
+ * original source URL). False when running from a compiled .js dist bundle.
+ *
+ * Used by both `daemonEntryScript()` and `daemonSpawnArgs()` to match the
+ * entry-point extension and the `--import tsx` loader flag.
+ */
+const _runningFromSource = import.meta.url.endsWith(".ts");
+
+/**
  * Path to the compiled daemon-entry script.
  * In dist/ layout the entry is dist/daemon-entry.js relative to this file.
  */
 function daemonEntryScript(): string {
   // When running from dist/ (compiled), daemon-entry.js is a sibling.
   // When running from src/ via tsx, daemon-entry.ts is a sibling.
-  const ext = import.meta.url.endsWith(".ts") ? ".ts" : ".js";
+  const ext = _runningFromSource ? ".ts" : ".js";
   return join(__dir, `daemon-entry${ext}`);
+}
+
+/**
+ * Build the Node.js argument array for spawning the daemon entry script.
+ *
+ * In development (TypeScript source, tsx loader): prepend `--import tsx` so
+ * the `.ts` entry script can be executed directly.
+ *
+ * In production (compiled dist, `.js` entry): omit `--import tsx` entirely —
+ * tsx is a devDependency and will not be present in a production install or
+ * on a remote host.
+ *
+ * This mirrors the logic in `daemonEntryScript()` so the two always agree on
+ * whether TypeScript sources or compiled JS files are in use.
+ */
+function daemonSpawnArgs(script: string, socketName: string, sessionName: string, socketPath: string): string[] {
+  const scriptArgs = [
+    script,
+    "--socket-name", socketName,
+    "--session-name", sessionName,
+    "--socket-path", socketPath,
+  ];
+  if (_runningFromSource) {
+    return ["--import", "tsx", ...scriptArgs];
+  }
+  return scriptArgs;
 }
 
 // ---------------------------------------------------------------------------
@@ -200,14 +238,8 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
     const script = daemonEntryScript();
 
     const proc = spawn(
-      process.execPath, // node
-      [
-        "--import", "tsx", // for TypeScript source; compiled dist won't need this
-        script,
-        "--socket-name", socketName,
-        "--session-name", sessionName,
-        "--socket-path", daemonSockPath,
-      ],
+      process.execPath, // node — always the VS Code Remote Server's own Node binary
+      daemonSpawnArgs(script, socketName, sessionName, daemonSockPath),
       {
         stdio: ["ignore", "pipe", "pipe"],
         detached: false,
