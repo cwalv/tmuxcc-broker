@@ -2,9 +2,12 @@
  * Runtime directory helpers — path resolution for broker and daemon sockets.
  *
  * Follows SCHEMA.md "Trust and security model":
- *   - Sockets live under $XDG_RUNTIME_DIR/tmuxcc/<broker-id>/ (or
- *     /tmp/tmuxcc-<uid>/ as fallback) with directory mode 0700 and socket
- *     mode 0600.
+ *   - Sockets live under $XDG_RUNTIME_DIR/tmuxcc/<socketName>/ (or
+ *     /tmp/tmuxcc-<uid>/<socketName>/ as fallback) with directory mode 0700
+ *     and socket mode 0600.
+ *   - The sub-directory name is the tmux socket name (e.g. "tmuxcc"), making
+ *     the broker socket path well-known and discoverable by clients:
+ *     `<runtimeDir>/<socketName>/broker.sock`.
  *
  * @module runtime-dir
  */
@@ -41,31 +44,35 @@ export function resolveBaseRuntimeDir(opts: RuntimeDirOptions = {}): string {
 }
 
 /**
- * Resolve the broker socket path: `<runtimeDir>/<brokerId>/broker.sock`.
- * Creates the broker sub-directory at mode 0700.
+ * Resolve the broker socket path: `<runtimeDir>/<socketName>/broker.sock`.
+ * Creates the socket-name sub-directory at mode 0700.
+ *
+ * The `socketName` is the tmux socket name (e.g. `"tmuxcc"`).  Using the
+ * socket name as the directory means the path is well-known and clients can
+ * discover it without out-of-band communication.
  */
 export function brokerSocketPath(
-  brokerId: string,
+  socketName: string,
   opts: RuntimeDirOptions = {},
 ): string {
   const base = resolveBaseRuntimeDir(opts);
-  const dir = path.join(base, brokerId);
+  const dir = path.join(base, socketName);
   ensureDir(dir, 0o700);
   return path.join(dir, "broker.sock");
 }
 
 /**
  * Resolve a daemon socket path:
- * `<runtimeDir>/<brokerId>/<sessionId>.sock`.
- * Re-uses the already-created broker sub-directory.
+ * `<runtimeDir>/<socketName>/<sessionId>.sock`.
+ * Re-uses the already-created socket-name sub-directory.
  */
 export function daemonSocketPath(
-  brokerId: string,
+  socketName: string,
   sessionId: string,
   opts: RuntimeDirOptions = {},
 ): string {
   const base = resolveBaseRuntimeDir(opts);
-  const dir = path.join(base, brokerId);
+  const dir = path.join(base, socketName);
   ensureDir(dir, 0o700);
   return path.join(dir, `${sessionId}.sock`);
 }

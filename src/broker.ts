@@ -37,7 +37,6 @@
  * @module broker
  */
 
-import { randomUUID } from "node:crypto";
 import * as path from "node:path";
 import {
   runServerHandshake,
@@ -145,7 +144,13 @@ const BROKER_CAPABILITIES: Capabilities = {
 
 class BrokerImpl implements BrokerHandle {
   private readonly _opts: BrokerOptions;
-  private readonly _brokerId: string;
+  /**
+   * The socket-name-derived identifier used as the runtime sub-directory.
+   * Equals `opts.socketName` so that broker socket paths are well-known and
+   * discoverable: `<runtime>/<socketName>/broker.sock`.
+   * One broker per tmux socket name — no UUID needed for isolation.
+   */
+  private readonly _socketDirName: string;
   private readonly _runtimeDirOpts: RuntimeDirOptions;
 
   /** Active client connections */
@@ -169,7 +174,7 @@ class BrokerImpl implements BrokerHandle {
 
   constructor(opts: BrokerOptions) {
     this._opts = opts;
-    this._brokerId = `broker-${randomUUID()}`;
+    this._socketDirName = opts.socketName;
     this._runtimeDirOpts = opts.runtimeDir !== undefined ? { runtimeDir: opts.runtimeDir } : {};
   }
 
@@ -181,7 +186,7 @@ class BrokerImpl implements BrokerHandle {
   async start(): Promise<void> {
     if (this._started) throw new Error("Broker already started");
 
-    this._socketPath = brokerSocketPath(this._brokerId, this._runtimeDirOpts);
+    this._socketPath = brokerSocketPath(this._socketDirName, this._runtimeDirOpts);
 
     // Remove stale socket file if present
     removeSocket(this._socketPath);
@@ -485,7 +490,7 @@ class BrokerImpl implements BrokerHandle {
 
     // Ensure daemon is running
     const daemonSockPath = daemonSocketPath(
-      this._brokerId,
+      this._socketDirName,
       entry.sessionId,
       this._runtimeDirOpts,
     );

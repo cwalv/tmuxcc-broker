@@ -34,7 +34,7 @@ import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
 
-import { createBroker, connectSocketTransport } from "./index.js";
+import { createBroker, connectSocketTransport, brokerSocketPath } from "./index.js";
 import type { BrokerHandle } from "./index.js";
 import type { Transport } from "@tmuxcc/daemon";
 
@@ -207,6 +207,28 @@ describe("broker – unit (no tmux)", () => {
       assert.ok(Array.isArray(snapshot.sessions));
       // No real tmux server → sessions should be empty
       assert.equal(snapshot.sessions.length, 0);
+    } finally {
+      await broker.shutdown();
+    }
+  });
+
+  it("U2: broker.endpoint() equals brokerSocketPath(socketName) — well-known path", async () => {
+    // This is the core regression guard for tc-j9c.8:
+    // broker.endpoint() must equal the path that vscode computes via
+    // brokerSocketPath(brokerSocketName) so that discovery works without
+    // out-of-band communication.
+    const socketName = nextSocketName();
+    const runtimeDir = `/tmp/tmuxcc-test-u2-${process.pid}`;
+    const broker = createBroker({ socketName, runtimeDir });
+    await broker.start();
+
+    try {
+      const expected = brokerSocketPath(socketName, { runtimeDir });
+      assert.equal(
+        broker.endpoint(),
+        expected,
+        `broker.endpoint() must equal brokerSocketPath(socketName): got ${broker.endpoint()}, want ${expected}`,
+      );
     } finally {
       await broker.shutdown();
     }
