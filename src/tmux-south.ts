@@ -111,6 +111,37 @@ export function createSession(socketName: string, name: string): void {
 }
 
 /**
+ * Set `synchronize-panes` for a specific tmux window.
+ *
+ * Runs `tmux -L <socketName> set-option -wt @<windowNum> synchronize-panes on|off`.
+ *
+ * `windowNum` is the numeric tmux window id (the N in `@N`).
+ * `on` specifies the desired state.
+ *
+ * Throws if the command fails (tmux server unavailable or invalid window target).
+ *
+ * tc-7xv.12: broker-side surface for `setSynchronizePanes`.  Routes through
+ * a connected daemon's `set-synchronize-panes` WireCommand when a daemon
+ * is available; falls back to this direct-tmux path otherwise.
+ */
+export function setWindowSynchronizePanes(
+  socketName: string,
+  windowNum: number,
+  on: boolean,
+): void {
+  const result = spawnSync(
+    "tmux",
+    ["-L", socketName, "set-option", "-wt", `@${windowNum}`, "synchronize-panes", on ? "on" : "off"],
+    { encoding: "utf8", timeout: 5_000 },
+  );
+  if (result.status !== 0 || result.error) {
+    throw new Error(
+      `tmux set-option synchronize-panes failed: ${result.stderr?.trim() ?? result.error?.message ?? "unknown error"}`,
+    );
+  }
+}
+
+/**
  * Run `tmux -L <socketName> kill-session -t <id>` to destroy a session.
  * `id` can be a session name or tmux `$N` id.
  * Throws if the command fails.

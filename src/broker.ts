@@ -61,7 +61,7 @@ import type {
 
 import { createSocketServer, createSocketTransport } from "./socket-transport.js";
 import { brokerSocketPath, daemonSocketPath, removeSocket, restrictSocket } from "./runtime-dir.js";
-import { listSessions, createSession, killSession, createTmuxWatcher } from "./tmux-south.js";
+import { listSessions, createSession, killSession, createTmuxWatcher, setWindowSynchronizePanes } from "./tmux-south.js";
 import { createDaemonSupervisor } from "./daemon-supervisor.js";
 import type { DaemonSupervisor } from "./daemon-supervisor.js";
 import type { RuntimeDirOptions } from "./runtime-dir.js";
@@ -103,6 +103,21 @@ export interface BrokerHandle {
    * The broker's unix socket path. Only valid after start() resolves.
    */
   endpoint(): string;
+
+  /**
+   * Toggle `synchronize-panes` for a tmux window (tc-7xv.12).
+   *
+   * `windowId` is the daemon wire WindowId (e.g. `"w3"` for tmux window `@3`).
+   * `on` controls the desired state.
+   *
+   * Issues `tmux set-option -wt @<N> synchronize-panes on|off` synchronously.
+   * The daemon connected to the session will detect the change via the
+   * `%window-option-changed` notification and push a `window.sync.changed`
+   * delta to all connected clients.
+   *
+   * Throws if tmux is unavailable or the window does not exist.
+   */
+  setSynchronizePanes(windowId: string, on: boolean): void;
 }
 
 // ---------------------------------------------------------------------------
@@ -181,6 +196,30 @@ class BrokerImpl implements BrokerHandle {
   endpoint(): string {
     if (!this._started) throw new Error("Broker not started");
     return this._socketPath;
+  }
+
+  setSynchronizePanes(windowId: string, on: boolean): void {
+    // Map wire WindowId ("w3") → tmux numeric id (3).
+    // Convention mirrors input-path.ts defaultWindowIdToTmux.
+    if (!windowId.startsWith("w")) {
+      throw Object.assign(
+        new Error(`setSynchronizePanes: invalid windowId "${windowId}" — must start with "w"`),
+        { code: "internal" },
+      );
+    }
+    const windowNum = parseInt(windowId.slice(1), 10);
+    if (Number.isNaN(windowNum)) {
+      throw Object.assign(
+        new Error(`setSynchronizePanes: cannot parse numeric window id from "${windowId}"`),
+        { code: "internal" },
+      );
+    }
+    try {
+      setWindowSynchronizePanes(this._opts.socketName, windowNum, on);
+    } catch (err: unknown) {
+      const msg = err instanceof Error ? err.message : String(err);
+      throw Object.assign(new Error(`tmux.unavailable: ${msg}`), { code: "tmux.unavailable" });
+    }
   }
 
   async start(): Promise<void> {
