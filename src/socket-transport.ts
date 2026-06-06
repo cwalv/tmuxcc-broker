@@ -79,24 +79,49 @@ class SocketTransport implements Transport {
   // Per-pane seq counters for sendData
   private _dataSeqs = new Map<string, number>();
 
+  // tc-7xv.6 / tc-7xv.24 backpressure: when socket.write() returns false (its
+  // kernel send-buffer is full) we record a single shared "drain" promise here
+  // and resolve it from socket's 'drain' event.  All subsequent sendData /
+  // sendControl callers receive the same promise so the upstream pipeline can
+  // await it before producing more bytes.  This is the standard Node.js
+  // Writable backpressure contract — see https://nodejs.org/api/stream.html
+  // "Buffering".  Without this, daemon-side flow-control credits bytes as
+  // "drained" the instant they enter the kernel send buffer, so tmux is never
+  // told to pause and the daemon's outbound buffer grows without bound — the
+  // root cause of the `find /` wedge.
+  private _drainPromise: Promise<void> | null = null;
+  private _drainResolve: (() => void) | null = null;
+
   constructor(socket: net.Socket) {
     this._socket = socket;
     socket.on("data", (chunk: Buffer) => { this._onData(chunk); });
     socket.on("close", () => { this._onClose(); });
     socket.on("error", (err) => { this._onClose(err); });
+    socket.on("drain", () => {
+      // Kernel send-buffer has drained.  Resolve the shared drain promise so
+      // all backpressured callers can proceed, then clear the field so the
+      // next backpressure window allocates a fresh promise.
+      const r = this._drainResolve;
+      this._drainPromise = null;
+      this._drainResolve = null;
+      if (r !== null) r();
+    });
   }
 
   // ── Control plane ──────────────────────────────────────────────────────────
 
-  sendControl(msg: Parameters<Transport["sendControl"]>[0]): void {
+  sendControl(msg: Parameters<Transport["sendControl"]>[0]): void | Promise<void> {
     if (this._closed) return;
     const json = JSON.stringify(msg);
     const payload = Buffer.from(json + "\n", "utf8");
     // Length-prefix the control message (4-byte u32be)
     const lenBuf = Buffer.allocUnsafe(CTRL_LEN_SIZE);
     lenBuf.writeUInt32BE(payload.length, 0);
-    this._socket.write(lenBuf);
-    this._socket.write(payload);
+    // Combine len+payload into a single write call so they cannot interleave
+    // with concurrent data-plane frames at the kernel boundary.  This also
+    // means socket.write returns one backpressure signal for the pair.
+    const ok = this._socket.write(Buffer.concat([lenBuf, payload]));
+    if (!ok) return this._ensureDrainPromise();
   }
 
   onControl(handler: ControlHandler): void {
@@ -105,14 +130,35 @@ class SocketTransport implements Transport {
 
   // ── Data plane ─────────────────────────────────────────────────────────────
 
-  sendData(paneId: PaneId, bytes: Uint8Array): void {
+  sendData(paneId: PaneId, bytes: Uint8Array): void | Promise<void> {
     if (this._closed) return;
     // Mint a per-pane seq and encode as a data frame
     const key = String(paneId);
     const seq = (this._dataSeqs.get(key) ?? 0);
     this._dataSeqs.set(key, (seq + 1) & MAX_U32);
     const frame = encodeFrame(paneId, seq, bytes);
-    this._socket.write(frame);
+    const ok = this._socket.write(frame);
+    if (!ok) return this._ensureDrainPromise();
+  }
+
+  /**
+   * Lazily build a shared promise that resolves on the next 'drain' event.
+   *
+   * One shared promise per backpressure window.  Concurrent senders that hit
+   * write()==false during the same window all await the same promise, so the
+   * pipeline can use `await tx.sendData(...)` as a natural backpressure point
+   * without registering N drain listeners.
+   *
+   * The constructor's 'drain' handler nullifies the field and invokes the
+   * stored resolve so the next backpressure window starts fresh.
+   */
+  private _ensureDrainPromise(): Promise<void> {
+    if (this._drainPromise !== null) return this._drainPromise;
+    if (this._closed) return Promise.resolve();
+    this._drainPromise = new Promise<void>((resolve) => {
+      this._drainResolve = resolve;
+    });
+    return this._drainPromise;
   }
 
   onData(handler: DataHandler): void {
@@ -128,6 +174,12 @@ class SocketTransport implements Transport {
   close(err?: Error): void {
     if (this._closed) return;
     this._closed = true;
+    // Release any awaiters on the drain promise so they can observe the close
+    // through their next send (which returns immediately when this._closed).
+    const r = this._drainResolve;
+    this._drainPromise = null;
+    this._drainResolve = null;
+    if (r !== null) r();
     this._socket.destroy(err);
     this._closeHandler?.(err);
     this._closeHandler = null;
@@ -136,7 +188,15 @@ class SocketTransport implements Transport {
   // ── Incoming data parser ───────────────────────────────────────────────────
 
   private _onData(chunk: Buffer): void {
-    this._buf = Buffer.concat([this._buf, chunk]);
+    // tc-7xv.6 / tc-7xv.24: Buffer.concat([this._buf, chunk]) is O(n²) when
+    // chunks arrive rapidly and the buffer is large — a contributing factor to
+    // the firehose wedge.  Concatenating with an explicit totalLength avoids
+    // the intermediate length computation traversal and lets V8 short-cut the
+    // copy when the result is sized correctly.
+    this._buf = Buffer.concat(
+      [this._buf, chunk],
+      this._buf.length + chunk.length,
+    );
 
     while (this._buf.length > 0) {
       const firstByte = this._buf[0] as number;
@@ -202,6 +262,11 @@ class SocketTransport implements Transport {
   private _onClose(err?: Error): void {
     if (this._closed) return;
     this._closed = true;
+    // Release any awaiters on the drain promise so they can observe the close.
+    const r = this._drainResolve;
+    this._drainPromise = null;
+    this._drainResolve = null;
+    if (r !== null) r();
     this._closeHandler?.(err);
     this._closeHandler = null;
   }
