@@ -56,6 +56,7 @@ import type {
   BrokerCommandResponseMessage,
   ErrorMessage,
   MessageBase,
+  PaneId,
   SessionId,
 } from "@tmuxcc/daemon";
 
@@ -179,7 +180,13 @@ interface ClientState {
 
 const BROKER_CAPABILITIES: Capabilities = {
   protocolVersion: WIRE_PROTOCOL_VERSION,
-  features: ["sessions-watch", "session-create", "session-destroy", "session-claim"],
+  features: [
+    "sessions-watch",
+    "session-create",
+    "session-destroy",
+    "session-claim",
+    "pane-attach", // tc-7xv.36
+  ],
 };
 
 // ---------------------------------------------------------------------------
@@ -469,7 +476,7 @@ class BrokerImpl implements BrokerHandle {
     const { correlationId, command } = req;
 
     try {
-      let payload: { sessionId?: SessionId; endpoint?: string; ok?: true };
+      let payload: { sessionId?: SessionId; endpoint?: string; paneId?: PaneId; ok?: true };
 
       switch (command.kind) {
         case "session.claim":
@@ -480,6 +487,13 @@ class BrokerImpl implements BrokerHandle {
           break;
         case "session.destroy":
           payload = await this._destroySession(command.sessionId);
+          break;
+        case "pane.attach":
+          // tc-7xv.36: attach intent for a specific pane.  The broker doesn't
+          // own pane-level state — it just ensures the daemon is running for
+          // the named session and echoes the paneId back so the client has a
+          // round-tripped acknowledgement of its targeted attach.
+          payload = await this._attachPane(command.sessionId, command.paneId);
           break;
         default: {
           const _exhaustive: never = command;
@@ -620,6 +634,49 @@ class BrokerImpl implements BrokerHandle {
 
     // Use claim semantics — create then spawn daemon
     return this._claimSession(name);
+  }
+
+  /**
+   * Handle `pane.attach` (tc-7xv.36).
+   *
+   * The broker doesn't track panes — it only knows about sessions.  This
+   * handler:
+   *   1. Verifies the named session exists in the broker's session table
+   *      (after a refresh from tmux).
+   *   2. Ensures the per-session daemon is running and returns its endpoint
+   *      (same path used by `session.claim`).
+   *   3. Echoes the supplied `paneId` back to the client as an acknowledgement
+   *      of the targeted-attach intent — the client uses it to drive its host-
+   *      pty binding decision.
+   *
+   * Pane existence is NOT validated here.  If the pane has disappeared by the
+   * time the client connects to the daemon, the daemon's snapshot simply will
+   * not contain it; the client is expected to detect the missing pane and
+   * surface a UI signal.  Validating in the broker would require the broker
+   * to inspect daemon-side state, which crosses the wire-contract invariant
+   * (the broker speaks in sessions, not panes).
+   */
+  private async _attachPane(
+    sessionId: SessionId,
+    paneId: PaneId,
+  ): Promise<{ sessionId: SessionId; endpoint: string; paneId: PaneId }> {
+    // Refresh the session table from tmux so a recently-disappeared session
+    // is detected promptly.
+    this._refreshSessions();
+
+    const entry = this._sessions.get(sessionId);
+    if (!entry) {
+      throw Object.assign(
+        new Error(`Session '${sessionId}' not found`),
+        { code: "session.not-found" },
+      );
+    }
+
+    // Ensure the daemon is up.  Reuse the same per-name claim semantics so
+    // concurrent pane.attach + session.claim requests share one spawn.
+    const { endpoint } = await this._claimSession(entry.name);
+
+    return { sessionId: entry.sessionId, endpoint, paneId };
   }
 
   private async _destroySession(

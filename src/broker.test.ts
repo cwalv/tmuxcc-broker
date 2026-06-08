@@ -78,7 +78,13 @@ function rejectAfter<T>(ms: number, message: string): [Promise<never>, () => voi
 
 const CLIENT_CAPS: Capabilities = {
   protocolVersion: WIRE_PROTOCOL_VERSION,
-  features: ["sessions-watch", "session-create", "session-destroy", "session-claim"],
+  features: [
+    "sessions-watch",
+    "session-create",
+    "session-destroy",
+    "session-claim",
+    "pane-attach", // tc-7xv.36
+  ],
 };
 
 const DAEMON_CLIENT_CAPS: Capabilities = {
@@ -351,6 +357,59 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
     assert.equal(added.type, "sessions.added");
     assert.ok(added.sessionId);
     assert.equal(added.name, "watch-target");
+
+    mux.transport.close();
+  });
+
+  it("I8 (tc-7xv.36): pane.attach returns the same daemon endpoint as session.claim and echoes paneId", async () => {
+    const { mux } = await connectToBroker(broker.endpoint());
+    const seq = { value: 1 };
+
+    // First claim the session so a daemon is running and we know its sessionId.
+    const claimResp = await sendBrokerCommand(mux, { kind: "session.claim", name: "pane-attach-target" }, seq);
+    assert.ok(claimResp.result.ok, `Claim failed: ${JSON.stringify(claimResp.result)}`);
+    const claimPayload = (claimResp.result as {
+      ok: true;
+      payload: { sessionId: string; endpoint: string };
+    }).payload;
+    const sessionId = claimPayload.sessionId;
+    const claimEndpoint = claimPayload.endpoint;
+
+    // Now attach to a specific pane.  The broker does not validate pane
+    // existence; this test simply asserts the round-trip shape.
+    const attachResp = await sendBrokerCommand(
+      mux,
+      { kind: "pane.attach", sessionId, paneId: "p1" },
+      seq,
+    );
+    assert.ok(
+      attachResp.result.ok,
+      `pane.attach failed: ${JSON.stringify(attachResp.result)}`,
+    );
+    const attachPayload = (attachResp.result as {
+      ok: true;
+      payload: { sessionId: string; endpoint: string; paneId: string };
+    }).payload;
+    assert.equal(attachPayload.sessionId, sessionId, "sessionId must match");
+    assert.equal(attachPayload.endpoint, claimEndpoint, "endpoint must match");
+    assert.equal(attachPayload.paneId, "p1", "paneId must echo back");
+
+    mux.transport.close();
+  });
+
+  it("I9 (tc-7xv.36): pane.attach returns session.not-found for unknown session", async () => {
+    const { mux } = await connectToBroker(broker.endpoint());
+    const seq = { value: 1 };
+
+    const resp = await sendBrokerCommand(
+      mux,
+      { kind: "pane.attach", sessionId: "s999-nonexistent", paneId: "p0" },
+      seq,
+    );
+
+    assert.equal(resp.result.ok, false);
+    const r = resp.result as { ok: false; code: string; message: string };
+    assert.equal(r.code, "session.not-found", `code should be session.not-found, got ${r.code}`);
 
     mux.transport.close();
   });
