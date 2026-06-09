@@ -282,8 +282,24 @@ class SocketTransport implements Transport {
         // installed a no-op), stop processing here and reschedule the remainder
         // so that microtasks (including async continuations that install the real
         // command handler) can run before the next buffered message is dispatched.
+        //
+        // IMPORTANT: use setImmediate, NOT process.nextTick.
+        //
+        // In Node.js, process.nextTick callbacks run BEFORE Promise microtasks
+        // in the same event loop turn.  The post-handshake onControl installation
+        // in _handleConnection happens inside an async/await continuation:
+        //
+        //   settle(() => resolve(session))  ← queues Promise microtask
+        //   process.nextTick(...)           ← fires BEFORE that microtask!
+        //   → _processBuffer runs with no-op handler still installed
+        //   → command.request dispatched to no-op → DROPPED
+        //   → _handleConnection finally runs, installs real handler — too late
+        //
+        // setImmediate fires AFTER all microtasks (Promises) have drained,
+        // giving the _handleConnection async continuation time to install the
+        // real command handler before the next buffered message is dispatched.
         if (this._controlHandler !== prevHandler && this._buf.length > 0) {
-          process.nextTick(() => { this._processBuffer(); });
+          setImmediate(() => { this._processBuffer(); });
           return;
         }
       }
