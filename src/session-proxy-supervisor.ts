@@ -21,7 +21,7 @@
  * # Data-plane endpoint convention
  *
  * Per SCHEMA.md: "SCHEMA.md mandates multiplexing control + data plane on the
- * same per-daemon socket via the 0xCC magic byte (already implemented in
+ * same per-session-proxy socket via the 0xCC magic byte (already implemented in
  * tmuxcc-daemon's framing.ts). The endpoint string IS the multiplexed socket."
  *
  * The endpoint returned by the supervisor IS the unix socket path on which the
