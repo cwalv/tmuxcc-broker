@@ -19,8 +19,10 @@
  * Data frames on the wire use the format defined in framing.ts / SCHEMA.md:
  *   [u8 MAGIC=0xCC][u32be SEQ][u32be PAYLEN][u16be IDLEN][PANEID UTF-8][PAYLOAD]
  *
- * Total frame size: 11 + IDLEN + PAYLEN bytes. The `FrameDecoder` from
- * @tmuxcc/daemon is used to parse incoming data frames.
+ * Total frame size: 11 + IDLEN + PAYLEN bytes. The receive path parses the
+ * frame header inline so it can consume EXACTLY one frame's bytes at a time —
+ * exact boundary tracking is what lets data and control units interleave
+ * arbitrarily across socket read chunks (tc-3y8.9; see _processBuffer).
  *
  * On the SEND side, `encodeFrame(paneId, seq, payload)` from @tmuxcc/daemon
  * produces the binary blob; we write it directly to the socket.
@@ -46,7 +48,7 @@
  */
 
 import * as net from "node:net";
-import { FrameDecoder, FRAME_MAGIC, encodeFrame } from "@tmuxcc/daemon";
+import { FRAME_MAGIC, MAX_FRAME, decodeFrame, encodeFrame } from "@tmuxcc/daemon";
 import type { Transport, ControlHandler, DataHandler, CloseHandler } from "@tmuxcc/daemon";
 import type { PaneId } from "@tmuxcc/daemon";
 
@@ -73,7 +75,6 @@ class SocketTransport implements Transport {
   private _closeHandler: CloseHandler | null = null;
 
   private _buf = Buffer.alloc(0);
-  private _frameDecoder = new FrameDecoder();
   private _closed = false;
 
   // Per-pane seq counters for sendData
@@ -220,43 +221,71 @@ class SocketTransport implements Transport {
    */
   private _processBuffer(): void {
     while (this._buf.length > 0) {
+      // A dispatched handler may close the transport synchronously — stop
+      // delivering buffered messages the moment that happens.
+      if (this._closed) return;
+
       const firstByte = this._buf[0] as number;
 
       if (firstByte === FRAME_MAGIC) {
-        // Data-plane frame: feed to FrameDecoder which handles its own buffering
-        // and returns complete frames. We give ALL current buffer bytes to it.
-        // FrameDecoder.push() expects a Uint8Array.
-        const input = new Uint8Array(this._buf.buffer, this._buf.byteOffset, this._buf.length);
-        let frames: ReturnType<FrameDecoder["push"]>;
-        try {
-          frames = this._frameDecoder.push(input);
-        } catch {
-          // Malformed data frame — close transport
+        // Data-plane frame: parse the header HERE and consume EXACTLY one
+        // frame's bytes from `_buf`, leaving any trailing bytes (more data
+        // frames OR control messages) for the next loop iteration.
+        //
+        // tc-3y8.9 root cause: the previous implementation fed the ENTIRE
+        // remaining buffer to a stateful FrameDecoder and cleared `_buf`.
+        // Exact byte boundaries were lost, with two fatal consequences on a
+        // real socket (reads do not respect write boundaries):
+        //
+        //   (A) A control message coalesced into the same chunk AFTER a data
+        //       frame hit FrameDecoder's magic check (its length prefix starts
+        //       0x00 ≠ 0xCC) → RangeError → transport torn down — the control
+        //       message (e.g. a pane.opened delta) died with the connection.
+        //   (B) A data frame SPLIT across two 'data' events left the decoder
+        //       holding the prefix while the continuation chunk — whose first
+        //       byte is arbitrary terminal-output payload, not 0xCC — was
+        //       misrouted to the control branch.  Its leading bytes were
+        //       misread as a u32be JSON length (printable ASCII ⇒ hundreds of
+        //       MB), so `_buf` waited forever for bytes that never come:
+        //       inbound silently stalled while the socket stayed open.
+        //       Outbound sends kept working — commands still reached tmux
+        //       while every daemon→client live delta vanished (the dead
+        //       live-delta path of tc-3y8.9 / the load-dependent delta stalls
+        //       of tc-3y8.4).
+        //
+        // Frame layout (framing.ts):
+        //   [0xCC][u32be SEQ][u32be PAYLEN @5][u16be IDLEN @9][PANEID][PAYLOAD]
+        const FRAME_HEADER_SIZE = 11;
+        if (this._buf.length < FRAME_HEADER_SIZE) break; // wait for full header
+
+        const payLen = this._buf.readUInt32BE(5);
+        const idLen = this._buf.readUInt16BE(9);
+
+        // Enforce the MAX_FRAME cap BEFORE waiting for the body, otherwise a
+        // corrupt/hostile PAYLEN (up to ~4 GiB) would stall the demux forever
+        // waiting for bytes that never arrive — the same silent-death mode
+        // this rewrite eliminates.
+        if (payLen > MAX_FRAME) {
           this.close(new Error("data-plane framing error"));
           return;
         }
-        // Consume ALL data from the buffer — FrameDecoder handles partial frames
-        // internally. We trust it to buffer incomplete frames.
-        // BUT: FrameDecoder may not consume the entire buffer if there are
-        // trailing control-plane bytes. We need to know how many bytes it consumed.
-        //
-        // FrameDecoder doesn't expose "bytes consumed". To handle interleaved
-        // control/data frames, we process the buffer byte-by-byte for the
-        // leading data-frame segment.
-        //
-        // However, in practice the daemon sends either all-data or all-control on
-        // a connection; mixing is uncommon. We handle it conservatively: once we
-        // see 0xCC, we feed the entire remaining buffer to FrameDecoder and clear
-        // the buffer. Any subsequent non-0xCC bytes after a data frame would be
-        // control messages that were already buffered by the decoder.
-        //
-        // A cleaner approach: determine exact data-frame byte boundaries.
-        // For now, after giving all data to FrameDecoder, clear buffer.
-        this._buf = Buffer.alloc(0);
-        for (const frame of frames) {
-          this._dataHandler?.(frame.paneId, frame.payload);
+
+        const totalFrameLen = FRAME_HEADER_SIZE + idLen + payLen;
+        if (this._buf.length < totalFrameLen) break; // wait for complete frame
+
+        const frameBytes = this._buf.subarray(0, totalFrameLen);
+        this._buf = this._buf.subarray(totalFrameLen);
+
+        let frame: ReturnType<typeof decodeFrame>;
+        try {
+          frame = decodeFrame(frameBytes);
+        } catch {
+          // Genuinely malformed frame (cannot happen for length/magic — both
+          // validated above — but decodeFrame is the single source of truth).
+          this.close(new Error("data-plane framing error"));
+          return;
         }
-        break;
+        this._dataHandler?.(frame.paneId, frame.payload);
       } else {
         // Control-plane: expect [u32be len][JSON bytes + "\n"]
         if (this._buf.length < CTRL_LEN_SIZE) break; // wait for more data
