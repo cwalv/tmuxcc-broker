@@ -1,34 +1,34 @@
 /**
- * broker.test.ts — integration + race tests for the tmuxcc-broker.
+ * server-proxy.test.ts — integration + race tests for the tmuxcc-broker.
  *
  * # Test categories
  *
  * ## Unit / handshake tests (always run)
  *
- * U1. Broker starts, accepts a connection, runs handshake, sends snapshot.
+ * U1. ServerProxy starts, accepts a connection, runs handshake, sends snapshot.
  *
  * ## Integration tests (guarded by tmux availability)
  *
- * I1. spawn a broker on a test socket, connect as a client, receive snapshot.
- * I2. session.claim creates a session + daemon + returns endpoint + created=true.
+ * I1. spawn a server-proxy on a test socket, connect as a client, receive snapshot.
+ * I2. session.claim creates a session + session-proxy + returns endpoint + created=true.
  * I3. session.claim on existing session returns same endpoint, created=false.
  * I4. session.create fails if name is already taken.
- * I5. session.destroy kills session + reaps daemon.
+ * I5. session.destroy kills session + reaps session-proxy.
  * I6. sessions.added delta is pushed to subscribers after session.claim.
- * I7. Connect to daemon endpoint, run snapshot + input round-trip (daemon wire).
+ * I7. Connect to session-proxy endpoint, run snapshot + input round-trip (session-proxy wire).
  *
  * ## Race test
  *
  * R1. 10 concurrent session.claim requests for the same name all receive
- *     the same sessionId + endpoint; only one daemon process is spawned;
+ *     the same sessionId + endpoint; only one session-proxy process is spawned;
  *     exactly one response reports created=true (tc-3y8.2).
  *
  * # Cleanup
  *
- * Each test creates its own broker with a unique test socket name
- * (tmuxcc-test-broker-<N>-<ts>) and calls broker.shutdown() in afterEach.
+ * Each test creates its own server-proxy with a unique test socket name
+ * (tmuxcc-test-broker-<N>-<ts>) and calls serverProxy.shutdown() in afterEach.
  *
- * @module broker.test
+ * @module serverProxy.test
  */
 
 import { describe, it, beforeEach, afterEach } from "node:test";
@@ -38,21 +38,21 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { createBroker, connectSocketTransport, brokerSocketPath } from "./index.js";
-import type { BrokerHandle, BrokerSelfExitReason } from "./index.js";
-import type { Transport } from "@tmuxcc/daemon";
+import { createServerProxy, connectSocketTransport, serverProxySocketPath } from "./index.js";
+import type { ServerProxyHandle, ServerProxySelfExitReason } from "./index.js";
+import type { Transport } from "@tmuxcc/session-proxy";
 
 import {
   runClientHandshake,
   WIRE_PROTOCOL_VERSION,
-} from "@tmuxcc/daemon";
+} from "@tmuxcc/session-proxy";
 import type {
-  BrokerSnapshotMessage,
-  BrokerCommandResponseMessage,
-  BrokerSessionAddedMessage,
+  ServerProxySnapshotMessage,
+  ServerProxyCommandResponseMessage,
+  ServerProxySessionAddedMessage,
   MessageBase,
   Capabilities,
-} from "@tmuxcc/daemon";
+} from "@tmuxcc/session-proxy";
 
 // ---------------------------------------------------------------------------
 // Helpers
@@ -131,7 +131,7 @@ const CLIENT_CAPS: Capabilities = {
   ],
 };
 
-const DAEMON_CLIENT_CAPS: Capabilities = {
+const SESSION_PROXY_CLIENT_CAPS: Capabilities = {
   protocolVersion: WIRE_PROTOCOL_VERSION,
   features: ["pane-lifecycle", "layout-updates", "focus-events", "input-forwarding"],
 };
@@ -169,22 +169,22 @@ class TransportMux {
   }
 }
 
-/** Connect to a broker and run the broker-wire handshake. Returns the mux. */
-async function connectToBroker(endpoint: string): Promise<{
+/** Connect to a server-proxy and run the server-proxy-wire handshake. Returns the mux. */
+async function connectToServerProxy(endpoint: string): Promise<{
   mux: TransportMux;
-  snapshot: BrokerSnapshotMessage;
+  snapshot: ServerProxySnapshotMessage;
 }> {
   const transport = await connectSocketTransport(endpoint);
 
   // Run the handshake FIRST. runClientHandshake installs and then removes
   // its own onControl handler (leaves it as a no-op). We must install
   // the TransportMux AFTER so its handler wins the single-slot competition.
-  await runClientHandshake(transport, CLIENT_CAPS, "broker.capabilities");
+  await runClientHandshake(transport, CLIENT_CAPS, "server-proxy.capabilities");
 
   // Now safe to install the mux — handshake has settled and cleared its handler.
   const mux = new TransportMux(transport);
 
-  // Snapshot is sent by the broker right after handshake. Since the TCP
+  // Snapshot is sent by the server-proxy right after handshake. Since the TCP
   // stream may already have buffered it by the time we install the mux,
   // we rely on the Node.js event loop: the mux handler fires on the NEXT
   // event-loop tick after socket data arrives, so as long as we install
@@ -195,38 +195,38 @@ async function connectToBroker(endpoint: string): Promise<{
   // the snapshot will be dropped. In that case, add a small delay or use
   // a different connection flow. For now, the synchronous handshake→mux
   // installation should be safe with socket transports.
-  const snapshotPromise = new Promise<BrokerSnapshotMessage>((resolve) => {
+  const snapshotPromise = new Promise<ServerProxySnapshotMessage>((resolve) => {
     const unsub = mux.subscribe((msg) => {
       if (msg.type === "sessions.snapshot") {
         unsub();
-        resolve(msg as unknown as BrokerSnapshotMessage);
+        resolve(msg as unknown as ServerProxySnapshotMessage);
       }
     });
   });
 
-  const [timeoutP, clearTimeoutP] = rejectAfter(5_000, "Timeout waiting for broker snapshot");
+  const [timeoutP, clearTimeoutP] = rejectAfter(5_000, "Timeout waiting for server-proxy snapshot");
   const snapshot = await Promise.race([snapshotPromise, timeoutP]);
   clearTimeoutP();
 
   return { mux, snapshot };
 }
 
-/** Send a broker command and wait for the correlated response. */
-async function sendBrokerCommand(
+/** Send a server-proxy command and wait for the correlated response. */
+async function sendServerProxyCommand(
   mux: TransportMux,
   command: { kind: string; [k: string]: unknown },
   outgoingSeq: { value: number },
-): Promise<BrokerCommandResponseMessage> {
+): Promise<ServerProxyCommandResponseMessage> {
   const correlationId = `corr-${Math.random().toString(36).slice(2)}`;
 
-  const responsePromise = new Promise<BrokerCommandResponseMessage>((resolve) => {
+  const responsePromise = new Promise<ServerProxyCommandResponseMessage>((resolve) => {
     const unsub = mux.subscribe((msg) => {
       if (
         msg.type === "command.response" &&
-        (msg as unknown as BrokerCommandResponseMessage).correlationId === correlationId
+        (msg as unknown as ServerProxyCommandResponseMessage).correlationId === correlationId
       ) {
         unsub();
-        resolve(msg as unknown as BrokerCommandResponseMessage);
+        resolve(msg as unknown as ServerProxyCommandResponseMessage);
       }
     });
   });
@@ -245,43 +245,43 @@ async function sendBrokerCommand(
 // Unit tests (no real tmux)
 // ---------------------------------------------------------------------------
 
-describe("broker – unit (no tmux)", () => {
-  it("U1: broker starts and sends snapshot after handshake", async () => {
+describe("server-proxy – unit (no tmux)", () => {
+  it("U1: server-proxy starts and sends snapshot after handshake", async () => {
     const socketName = nextSocketName();
-    const broker = createBroker({ socketName });
-    await broker.start();
+    const serverProxy = createServerProxy({ socketName });
+    await serverProxy.start();
 
     try {
-      const { snapshot } = await connectToBroker(broker.endpoint());
+      const { snapshot } = await connectToServerProxy(serverProxy.endpoint());
       assert.equal(snapshot.type, "sessions.snapshot");
       assert.ok(Array.isArray(snapshot.sessions));
       // No real tmux server → sessions should be empty
       assert.equal(snapshot.sessions.length, 0);
     } finally {
-      await broker.shutdown();
+      await serverProxy.shutdown();
     }
   });
 
-  it("U3 (tc-k6v): broker.info returns identity fields without tmux", async () => {
+  it("U3 (tc-k6v): server-proxy.info returns identity fields without tmux", async () => {
     const socketName = nextSocketName();
-    const broker = createBroker({ socketName });
-    await broker.start();
+    const serverProxy = createServerProxy({ socketName });
+    await serverProxy.start();
 
     try {
-      const { mux } = await connectToBroker(broker.endpoint());
+      const { mux } = await connectToServerProxy(serverProxy.endpoint());
       const seq = { value: 1 };
 
-      const resp = await sendBrokerCommand(mux, { kind: "broker.info" }, seq);
+      const resp = await sendServerProxyCommand(mux, { kind: "server-proxy.info" }, seq);
       assert.ok(resp.result.ok, `Expected ok=true, got: ${JSON.stringify(resp.result)}`);
       const info = (resp.result as {
         ok: true;
-        payload: { info: import("@tmuxcc/daemon").BrokerInfoPayload };
+        payload: { info: import("@tmuxcc/session-proxy").ServerProxyInfoPayload };
       }).payload.info;
 
       assert.equal(info.socketName, socketName);
-      assert.equal(info.brokerSocketPath, broker.endpoint());
-      // In-process broker → its pid is this test process's pid.
-      assert.equal(info.brokerPid, process.pid);
+      assert.equal(info.serverProxySocketPath, serverProxy.endpoint());
+      // In-process server-proxy → its pid is this test process's pid.
+      assert.equal(info.serverProxyPid, process.pid);
       assert.ok(info.uptimeMs >= 0, `uptimeMs must be >= 0, got ${info.uptimeMs}`);
       // No tmux server on this unique socket → null pid, no sessions, not adopted.
       assert.equal(info.tmuxServerPid, null);
@@ -292,55 +292,55 @@ describe("broker – unit (no tmux)", () => {
         info.connectedClientCount >= 1,
         `connectedClientCount must include the requesting client, got ${info.connectedClientCount}`,
       );
-      // Programmatic broker (no entry point) → no log file.
+      // Programmatic serverProxy (no entry point) → no log file.
       assert.equal(info.logPath, null);
 
       mux.transport.close();
     } finally {
-      await broker.shutdown();
+      await serverProxy.shutdown();
     }
   });
 
-  it("U4 (tc-k6v): broker.info reports logPath verbatim when configured", async () => {
+  it("U4 (tc-k6v): server-proxy.info reports logPath verbatim when configured", async () => {
     const socketName = nextSocketName();
-    const broker = createBroker({ socketName, logPath: "/tmp/some-broker.log" });
-    await broker.start();
+    const serverProxy = createServerProxy({ socketName, logPath: "/tmp/some-server-proxy.log" });
+    await serverProxy.start();
 
     try {
-      const { mux } = await connectToBroker(broker.endpoint());
+      const { mux } = await connectToServerProxy(serverProxy.endpoint());
       const seq = { value: 1 };
-      const resp = await sendBrokerCommand(mux, { kind: "broker.info" }, seq);
+      const resp = await sendServerProxyCommand(mux, { kind: "server-proxy.info" }, seq);
       assert.ok(resp.result.ok);
       const info = (resp.result as {
         ok: true;
-        payload: { info: import("@tmuxcc/daemon").BrokerInfoPayload };
+        payload: { info: import("@tmuxcc/session-proxy").ServerProxyInfoPayload };
       }).payload.info;
-      assert.equal(info.logPath, "/tmp/some-broker.log");
+      assert.equal(info.logPath, "/tmp/some-server-proxy.log");
       mux.transport.close();
     } finally {
-      await broker.shutdown();
+      await serverProxy.shutdown();
     }
   });
 
-  it("U2: broker.endpoint() equals brokerSocketPath(socketName) — well-known path", async () => {
+  it("U2: serverProxy.endpoint() equals serverProxySocketPath(socketName) — well-known path", async () => {
     // This is the core regression guard for tc-j9c.8:
-    // broker.endpoint() must equal the path that vscode computes via
-    // brokerSocketPath(brokerSocketName) so that discovery works without
+    // serverProxy.endpoint() must equal the path that vscode computes via
+    // serverProxySocketPath(serverProxySocketName) so that discovery works without
     // out-of-band communication.
     const socketName = nextSocketName();
     const runtimeDir = `/tmp/tmuxcc-test-u2-${process.pid}`;
-    const broker = createBroker({ socketName, runtimeDir });
-    await broker.start();
+    const serverProxy = createServerProxy({ socketName, runtimeDir });
+    await serverProxy.start();
 
     try {
-      const expected = brokerSocketPath(socketName, { runtimeDir });
+      const expected = serverProxySocketPath(socketName, { runtimeDir });
       assert.equal(
-        broker.endpoint(),
+        serverProxy.endpoint(),
         expected,
-        `broker.endpoint() must equal brokerSocketPath(socketName): got ${broker.endpoint()}, want ${expected}`,
+        `serverProxy.endpoint() must equal serverProxySocketPath(socketName): got ${serverProxy.endpoint()}, want ${expected}`,
       );
     } finally {
-      await broker.shutdown();
+      await serverProxy.shutdown();
     }
   });
 });
@@ -351,32 +351,32 @@ describe("broker – unit (no tmux)", () => {
 
 const TMUX_AVAILABLE = tmuxAvailable();
 
-describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, () => {
-  let broker: BrokerHandle;
+describe("server-proxy – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, () => {
+  let serverProxy: ServerProxyHandle;
   let socketName: string;
 
   beforeEach(async () => {
     socketName = nextSocketName();
-    broker = createBroker({ socketName });
-    await broker.start();
+    serverProxy = createServerProxy({ socketName });
+    await serverProxy.start();
   });
 
   afterEach(async () => {
-    await broker.shutdown();
+    await serverProxy.shutdown();
     spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
   });
 
-  it("I1: connect to broker and receive empty snapshot", async () => {
-    const { snapshot } = await connectToBroker(broker.endpoint());
+  it("I1: connect to server-proxy and receive empty snapshot", async () => {
+    const { snapshot } = await connectToServerProxy(serverProxy.endpoint());
     assert.equal(snapshot.type, "sessions.snapshot");
     assert.equal(snapshot.sessions.length, 0);
   });
 
-  it("I2: session.claim creates a session and daemon, returns endpoint + created=true", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+  it("I2: session.claim creates a session and sessionProxy, returns endpoint + created=true", async () => {
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
-    const resp = await sendBrokerCommand(mux, { kind: "session.claim", name: "test-claim" }, seq);
+    const resp = await sendServerProxyCommand(mux, { kind: "session.claim", name: "test-claim" }, seq);
 
     assert.ok(resp.result.ok, `Expected ok=true, got: ${JSON.stringify(resp.result)}`);
     const payload = (resp.result as { ok: true; payload: { sessionId: string; endpoint: string; created: boolean } }).payload;
@@ -390,11 +390,11 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
   });
 
   it("I3: session.claim on same name returns same sessionId + endpoint, created=false", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
-    const resp1 = await sendBrokerCommand(mux, { kind: "session.claim", name: "reuse-me" }, seq);
-    const resp2 = await sendBrokerCommand(mux, { kind: "session.claim", name: "reuse-me" }, seq);
+    const resp1 = await sendServerProxyCommand(mux, { kind: "session.claim", name: "reuse-me" }, seq);
+    const resp2 = await sendServerProxyCommand(mux, { kind: "session.claim", name: "reuse-me" }, seq);
 
     assert.ok(resp1.result.ok);
     assert.ok(resp2.result.ok);
@@ -412,10 +412,10 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
   });
 
   it("I4: session.create fails if name is already taken", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
-    const r1 = await sendBrokerCommand(mux, { kind: "session.create", name: "unique-sess" }, seq);
+    const r1 = await sendServerProxyCommand(mux, { kind: "session.create", name: "unique-sess" }, seq);
     assert.ok(r1.result.ok, `First create failed: ${JSON.stringify(r1.result)}`);
     // tc-3y8.2: a successful session.create always mints → created=true.
     assert.equal(
@@ -424,43 +424,43 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
       "session.create must report created=true on success",
     );
 
-    const r2 = await sendBrokerCommand(mux, { kind: "session.create", name: "unique-sess" }, seq);
+    const r2 = await sendServerProxyCommand(mux, { kind: "session.create", name: "unique-sess" }, seq);
     assert.equal(r2.result.ok, false);
     assert.equal((r2.result as { ok: false; code: string }).code, "session.name-taken");
 
     mux.transport.close();
   });
 
-  it("I5: session.destroy kills session and reaps daemon", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+  it("I5: session.destroy kills session and reaps session-proxy", async () => {
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
-    const claimResp = await sendBrokerCommand(mux, { kind: "session.claim", name: "to-destroy" }, seq);
+    const claimResp = await sendServerProxyCommand(mux, { kind: "session.claim", name: "to-destroy" }, seq);
     assert.ok(claimResp.result.ok);
     const sessionId = (claimResp.result as { ok: true; payload: { sessionId: string } }).payload.sessionId;
 
-    const destroyResp = await sendBrokerCommand(mux, { kind: "session.destroy", sessionId }, seq);
+    const destroyResp = await sendServerProxyCommand(mux, { kind: "session.destroy", sessionId }, seq);
     assert.ok(destroyResp.result.ok, `Destroy failed: ${JSON.stringify(destroyResp.result)}`);
 
     mux.transport.close();
   });
 
   it("I6: sessions.added is pushed to subscribers after session.claim", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
     // Set up delta listener BEFORE the command
-    const addedPromise = new Promise<BrokerSessionAddedMessage>((resolve) => {
+    const addedPromise = new Promise<ServerProxySessionAddedMessage>((resolve) => {
       const unsub = mux.subscribe((msg) => {
         if (msg.type === "sessions.added") {
           unsub();
-          resolve(msg as unknown as BrokerSessionAddedMessage);
+          resolve(msg as unknown as ServerProxySessionAddedMessage);
         }
       });
     });
 
     // Trigger session creation
-    const claimResp = await sendBrokerCommand(mux, { kind: "session.claim", name: "watch-target" }, seq);
+    const claimResp = await sendServerProxyCommand(mux, { kind: "session.claim", name: "watch-target" }, seq);
     assert.ok(claimResp.result.ok, `Claim failed: ${JSON.stringify(claimResp.result)}`);
 
     // The sessions.added delta is sent when the session first appears.
@@ -477,12 +477,12 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
     mux.transport.close();
   });
 
-  it("I8 (tc-7xv.36): pane.attach returns the same daemon endpoint as session.claim and echoes paneId", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+  it("I8 (tc-7xv.36): pane.attach returns the same session-proxy endpoint as session.claim and echoes paneId", async () => {
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
-    // First claim the session so a daemon is running and we know its sessionId.
-    const claimResp = await sendBrokerCommand(mux, { kind: "session.claim", name: "pane-attach-target" }, seq);
+    // First claim the session so a session-proxy is running and we know its sessionId.
+    const claimResp = await sendServerProxyCommand(mux, { kind: "session.claim", name: "pane-attach-target" }, seq);
     assert.ok(claimResp.result.ok, `Claim failed: ${JSON.stringify(claimResp.result)}`);
     const claimPayload = (claimResp.result as {
       ok: true;
@@ -491,9 +491,9 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
     const sessionId = claimPayload.sessionId;
     const claimEndpoint = claimPayload.endpoint;
 
-    // Now attach to a specific pane.  The broker does not validate pane
+    // Now attach to a specific pane.  The server-proxy does not validate pane
     // existence; this test simply asserts the round-trip shape.
-    const attachResp = await sendBrokerCommand(
+    const attachResp = await sendServerProxyCommand(
       mux,
       { kind: "pane.attach", sessionId, paneId: "p1" },
       seq,
@@ -514,10 +514,10 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
   });
 
   it("I9 (tc-7xv.36): pane.attach returns session.not-found for unknown session", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
-    const resp = await sendBrokerCommand(
+    const resp = await sendServerProxyCommand(
       mux,
       { kind: "pane.attach", sessionId: "s999-nonexistent", paneId: "p0" },
       seq,
@@ -530,19 +530,19 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
     mux.transport.close();
   });
 
-  it("I10 (tc-k6v): broker.info reports tmux server pid + per-session daemon pid and pane count", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+  it("I10 (tc-k6v): server-proxy.info reports tmux server pid + per-session session-proxy pid and pane count", async () => {
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
-    // Claim a session so a tmux server, session, and daemon all exist.
-    const claimResp = await sendBrokerCommand(mux, { kind: "session.claim", name: "info-target" }, seq);
+    // Claim a session so a tmux server, session, and session-proxy all exist.
+    const claimResp = await sendServerProxyCommand(mux, { kind: "session.claim", name: "info-target" }, seq);
     assert.ok(claimResp.result.ok, `Claim failed: ${JSON.stringify(claimResp.result)}`);
 
-    const resp = await sendBrokerCommand(mux, { kind: "broker.info" }, seq);
-    assert.ok(resp.result.ok, `broker.info failed: ${JSON.stringify(resp.result)}`);
+    const resp = await sendServerProxyCommand(mux, { kind: "server-proxy.info" }, seq);
+    assert.ok(resp.result.ok, `server-proxy.info failed: ${JSON.stringify(resp.result)}`);
     const info = (resp.result as {
       ok: true;
-      payload: { info: import("@tmuxcc/daemon").BrokerInfoPayload };
+      payload: { info: import("@tmuxcc/session-proxy").ServerProxyInfoPayload };
     }).payload.info;
 
     // tmux server pid is live.
@@ -551,15 +551,15 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
       `tmuxServerPid must be a live pid, got ${String(info.tmuxServerPid)}`,
     );
 
-    // The claimed session appears with a live daemon pid and ≥1 window/pane.
+    // The claimed session appears with a live session-proxy pid and ≥1 window/pane.
     const row = info.sessions.find((s) => s.name === "info-target");
-    assert.ok(row, `broker.info sessions must include 'info-target': ${JSON.stringify(info.sessions)}`);
+    assert.ok(row, `server-proxy.info sessions must include 'info-target': ${JSON.stringify(info.sessions)}`);
     assert.ok(
-      typeof row.daemonPid === "number" && row.daemonPid > 0,
-      `daemonPid must be a live pid, got ${String(row.daemonPid)}`,
+      typeof row.sessionProxyPid === "number" && row.sessionProxyPid > 0,
+      `sessionProxyPid must be a live pid, got ${String(row.sessionProxyPid)}`,
     );
     // kill -0 probes liveness without sending a signal.
-    assert.doesNotThrow(() => process.kill(row.daemonPid as number, 0), "daemonPid must be running");
+    assert.doesNotThrow(() => process.kill(row.sessionProxyPid as number, 0), "sessionProxyPid must be running");
     assert.ok(row.windowCount >= 1, `windowCount must be >= 1, got ${row.windowCount}`);
     assert.ok(row.paneCount >= 1, `paneCount must be >= 1, got ${row.paneCount}`);
     assert.ok(
@@ -570,15 +570,15 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
     mux.transport.close();
   });
 
-  it("I11 (tc-3y8.7): attachedClientCount is external-only — daemon+watcher do not inflate the count", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+  it("I11 (tc-3y8.7): attachedClientCount is external-only — session-proxy+watcher do not inflate the count", async () => {
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
     // Claim a session.  This attaches two tmuxcc-owned control-mode clients:
-    //   1. the broker's watcher (flags: control-mode, ignore-size, no-output)
-    //   2. the session daemon (flags: control-mode)
+    //   1. the server-proxy's watcher (flags: control-mode, ignore-size, no-output)
+    //   2. the session sessionProxy (flags: control-mode)
     // Wait a moment for the watcher to fully attach (it polls/attaches async).
-    const claimResp = await sendBrokerCommand(mux, { kind: "session.claim", name: "own-clients-test" }, seq);
+    const claimResp = await sendServerProxyCommand(mux, { kind: "session.claim", name: "own-clients-test" }, seq);
     assert.ok(claimResp.result.ok, `Claim failed: ${JSON.stringify(claimResp.result)}`);
 
     // Give the watcher time to attach so session_attached is stable.
@@ -590,63 +590,63 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
     // A small additional wait for the tmux session_attached counter to settle.
     await new Promise((r) => setTimeout(r, 500));
 
-    // snapshot via sessions.snapshot on a fresh broker connection — counts
-    // are refreshed by the broker when building the snapshot.
-    const { snapshot } = await connectToBroker(broker.endpoint());
+    // snapshot via sessions.snapshot on a fresh server-proxy connection — counts
+    // are refreshed by the server-proxy when building the snapshot.
+    const { snapshot } = await connectToServerProxy(serverProxy.endpoint());
     const sessionInfo = snapshot.sessions.find((s) => s.name === "own-clients-test");
     assert.ok(
       sessionInfo,
       `sessions.snapshot must include 'own-clients-test': ${JSON.stringify(snapshot.sessions)}`,
     );
-    // With daemon + watcher attached but NO real human clients, external count = 0.
+    // With session-proxy + watcher attached but NO real human clients, external count = 0.
     assert.equal(
       sessionInfo.attachedClientCount,
       0,
-      `attachedClientCount must be 0 (daemon and watcher are tmuxcc-owned, not external); got ${sessionInfo.attachedClientCount}`,
+      `attachedClientCount must be 0 (session-proxy and watcher are tmuxcc-owned, not external); got ${sessionInfo.attachedClientCount}`,
     );
 
-    // Also verify via broker.info, which uses the same session-table entry.
-    const infoResp = await sendBrokerCommand(mux, { kind: "broker.info" }, seq);
-    assert.ok(infoResp.result.ok, `broker.info failed: ${JSON.stringify(infoResp.result)}`);
+    // Also verify via server-proxy.info, which uses the same session-table entry.
+    const infoResp = await sendServerProxyCommand(mux, { kind: "server-proxy.info" }, seq);
+    assert.ok(infoResp.result.ok, `server-proxy.info failed: ${JSON.stringify(infoResp.result)}`);
     const info = (infoResp.result as {
       ok: true;
-      payload: { info: import("@tmuxcc/daemon").BrokerInfoPayload };
+      payload: { info: import("@tmuxcc/session-proxy").ServerProxyInfoPayload };
     }).payload.info;
     const infoRow = info.sessions.find((s) => s.name === "own-clients-test");
     assert.ok(
       infoRow,
-      `broker.info sessions must include 'own-clients-test': ${JSON.stringify(info.sessions)}`,
+      `server-proxy.info sessions must include 'own-clients-test': ${JSON.stringify(info.sessions)}`,
     );
     assert.equal(
       infoRow.attachedClientCount,
       0,
-      `broker.info attachedClientCount must be 0 for external-only semantics; got ${infoRow.attachedClientCount}`,
+      `server-proxy.info attachedClientCount must be 0 for external-only semantics; got ${infoRow.attachedClientCount}`,
     );
 
     mux.transport.close();
   });
 
-  it("I7: connect to daemon endpoint and run snapshot round-trip", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+  it("I7: connect to session-proxy endpoint and run snapshot round-trip", async () => {
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
-    const claimResp = await sendBrokerCommand(mux, { kind: "session.claim", name: "daemon-rtrip" }, seq);
+    const claimResp = await sendServerProxyCommand(mux, { kind: "session.claim", name: "session-proxy-rtrip" }, seq);
     assert.ok(claimResp.result.ok, `Claim failed: ${JSON.stringify(claimResp.result)}`);
     const endpoint = (claimResp.result as { ok: true; payload: { endpoint: string } }).payload.endpoint;
 
-    // Connect to the daemon endpoint using a socket transport.
-    // Run the handshake FIRST (same pattern as connectToBroker): the handshake
+    // Connect to the session-proxy endpoint using a socket transport.
+    // Run the handshake FIRST (same pattern as connectToServerProxy): the handshake
     // installs and then resets its own onControl handler. Install the mux
     // AFTER so its fanout handler wins the single-slot competition.
-    const daemonTransport = await connectSocketTransport(endpoint);
-    await runClientHandshake(daemonTransport, DAEMON_CLIENT_CAPS, "daemon.capabilities");
+    const sessionProxyTransport = await connectSocketTransport(endpoint);
+    await runClientHandshake(sessionProxyTransport, SESSION_PROXY_CLIENT_CAPS, "session-proxy.capabilities");
 
     // Now safe to install the mux — handshake has settled and cleared its handler.
-    // The daemon snapshot arrives after the handshake, so this is not a race.
-    const daemonMux = new TransportMux(daemonTransport);
+    // The session-proxy snapshot arrives after the handshake, so this is not a race.
+    const sessionProxyMux = new TransportMux(sessionProxyTransport);
 
     const snapshotPromise2 = new Promise<unknown>((resolve) => {
-      const unsub = daemonMux.subscribe((msg) => {
+      const unsub = sessionProxyMux.subscribe((msg) => {
         if (msg.type === "snapshot") {
           unsub();
           resolve(msg);
@@ -654,17 +654,17 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
       });
     });
 
-    const [daemonTimeoutP, clearDaemonTimeout] = rejectAfter(10_000, "Timeout waiting for daemon snapshot");
-    const snapshot2 = await Promise.race([snapshotPromise2, daemonTimeoutP]);
-    clearDaemonTimeout();
+    const [sessionProxyTimeoutP, clearSessionProxyTimeout] = rejectAfter(10_000, "Timeout waiting for session-proxy snapshot");
+    const snapshot2 = await Promise.race([snapshotPromise2, sessionProxyTimeoutP]);
+    clearSessionProxyTimeout();
 
-    // Daemon SnapshotMessage (wire v3, tc-j9c.2) has singular `session: SnapshotSession`
+    // SessionProxy SnapshotMessage (wire v3, tc-j9c.2) has singular `session: SnapshotSession`
     assert.equal((snapshot2 as { type: string }).type, "snapshot");
     const sess2 = (snapshot2 as { session: { sessionId: string; name: string } }).session;
-    assert.ok(sess2, "Daemon snapshot must have a `session` field");
-    assert.ok(sess2.sessionId, "Daemon snapshot session must have sessionId");
+    assert.ok(sess2, "SessionProxy snapshot must have a `session` field");
+    assert.ok(sess2.sessionId, "SessionProxy snapshot session must have sessionId");
 
-    daemonTransport.close();
+    sessionProxyTransport.close();
     mux.transport.close();
   });
 });
@@ -674,26 +674,26 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
 // ---------------------------------------------------------------------------
 
 describe("tc-w61: @tmuxcc 1 marker set on spawn / claim", { skip: !TMUX_AVAILABLE }, () => {
-  let broker: BrokerHandle;
+  let serverProxy: ServerProxyHandle;
   let socketName: string;
 
   beforeEach(async () => {
     socketName = nextSocketName();
-    broker = createBroker({ socketName });
-    await broker.start();
+    serverProxy = createServerProxy({ socketName });
+    await serverProxy.start();
   });
 
   afterEach(async () => {
-    await broker.shutdown();
+    await serverProxy.shutdown();
     spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
   });
 
   it("M1: session.claim sets @tmuxcc 1 on the spawned tmux session", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
     const sessionName = "tc-w61-marker-spawn";
-    const resp = await sendBrokerCommand(mux, { kind: "session.claim", name: sessionName }, seq);
+    const resp = await sendServerProxyCommand(mux, { kind: "session.claim", name: sessionName }, seq);
     assert.ok(resp.result.ok, `session.claim failed: ${JSON.stringify(resp.result)}`);
 
     // Verify @tmuxcc 1 is set on the real tmux session.
@@ -714,11 +714,11 @@ describe("tc-w61: @tmuxcc 1 marker set on spawn / claim", { skip: !TMUX_AVAILABL
   });
 
   it("M2: session.create sets @tmuxcc 1 on the spawned tmux session", async () => {
-    const { mux } = await connectToBroker(broker.endpoint());
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
 
     const sessionName = "tc-w61-marker-create";
-    const resp = await sendBrokerCommand(mux, { kind: "session.create", name: sessionName }, seq);
+    const resp = await sendServerProxyCommand(mux, { kind: "session.create", name: sessionName }, seq);
     assert.ok(resp.result.ok, `session.create failed: ${JSON.stringify(resp.result)}`);
 
     const markerResult = spawnSync(
@@ -737,7 +737,7 @@ describe("tc-w61: @tmuxcc 1 marker set on spawn / claim", { skip: !TMUX_AVAILABL
   });
 
   it("M3: mark-on-attach — claiming a pre-existing unmarked session sets @tmuxcc 1", async () => {
-    // Create a plain tmux session WITHOUT going through the broker (simulates
+    // Create a plain tmux session WITHOUT going through the serverProxy (simulates
     // a session the user created before tmuxcc was installed, or one they created
     // with plain `tmux new-session`).
     const sessionName = "tc-w61-preexisting";
@@ -761,10 +761,10 @@ describe("tc-w61: @tmuxcc 1 marker set on spawn / claim", { skip: !TMUX_AVAILABL
       "Pre-existing session must NOT have @tmuxcc 1 before claiming",
     );
 
-    // Now claim the session through the broker.  This should trigger mark-on-attach.
-    const { mux } = await connectToBroker(broker.endpoint());
+    // Now claim the session through the server-proxy.  This should trigger mark-on-attach.
+    const { mux } = await connectToServerProxy(serverProxy.endpoint());
     const seq = { value: 1 };
-    const resp = await sendBrokerCommand(mux, { kind: "session.claim", name: sessionName }, seq);
+    const resp = await sendServerProxyCommand(mux, { kind: "session.claim", name: sessionName }, seq);
     assert.ok(resp.result.ok, `session.claim failed: ${JSON.stringify(resp.result)}`);
 
     // Verify the marker is now set.
@@ -788,34 +788,34 @@ describe("tc-w61: @tmuxcc 1 marker set on spawn / claim", { skip: !TMUX_AVAILABL
 // Race test (requires tmux)
 // ---------------------------------------------------------------------------
 
-describe("broker – race test (requires tmux)", { skip: !TMUX_AVAILABLE }, () => {
-  let broker: BrokerHandle;
+describe("server-proxy – race test (requires tmux)", { skip: !TMUX_AVAILABLE }, () => {
+  let serverProxy: ServerProxyHandle;
   let socketName: string;
 
   beforeEach(async () => {
     socketName = nextSocketName();
-    broker = createBroker({ socketName });
-    await broker.start();
+    serverProxy = createServerProxy({ socketName });
+    await serverProxy.start();
   });
 
   afterEach(async () => {
-    await broker.shutdown();
+    await serverProxy.shutdown();
     spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
   });
 
   it("R1: 10 concurrent claims of the same name all get the same sessionId + endpoint", async () => {
     const N = 10;
-    const endpoint = broker.endpoint();
+    const endpoint = serverProxy.endpoint();
 
     // Open N connections, all in parallel
     const connections = await Promise.all(
-      Array.from({ length: N }, () => connectToBroker(endpoint)),
+      Array.from({ length: N }, () => connectToServerProxy(endpoint)),
     );
 
     // Issue all 10 session.claim requests concurrently
     const responses = await Promise.all(
       connections.map(({ mux }, i) =>
-        sendBrokerCommand(mux, { kind: "session.claim", name: "race-session" }, { value: i * 100 + 1 }),
+        sendServerProxyCommand(mux, { kind: "session.claim", name: "race-session" }, { value: i * 100 + 1 }),
       ),
     );
 
@@ -854,31 +854,31 @@ describe("broker – race test (requires tmux)", { skip: !TMUX_AVAILABLE }, () =
 // Self-exit lifecycle tests (tc-3iv, ext-a-design-context.md §6.2)
 // ---------------------------------------------------------------------------
 
-describe("broker – self-exit: idle hysteresis (tc-3iv)", () => {
+describe("server-proxy – self-exit: idle hysteresis (tc-3iv)", () => {
   it("S1: zero IPC clients past hysteresis → self-exit, socket unlinked, respawn works", async () => {
     const socketName = nextSocketName();
     const runtimeDir = makeRuntimeDir("s1");
     // Injected short hysteresis — do NOT literally wait 5 minutes in tests.
-    const broker = createBroker({ socketName, runtimeDir, idleExitMs: 500 });
-    const exits: BrokerSelfExitReason[] = [];
-    broker.onSelfExit((reason) => exits.push(reason));
-    await broker.start();
-    const endpoint = broker.endpoint();
+    const serverProxy = createServerProxy({ socketName, runtimeDir, idleExitMs: 500 });
+    const exits: ServerProxySelfExitReason[] = [];
+    serverProxy.onSelfExit((reason) => exits.push(reason));
+    await serverProxy.start();
+    const endpoint = serverProxy.endpoint();
 
     try {
       assert.ok(fs.existsSync(endpoint), "socket file must exist after start");
-      assert.equal(broker.connectedClientCount, 0);
+      assert.equal(serverProxy.connectedClientCount, 0);
 
       // Connect a raw client — "client" means ANY open unix-domain connection,
       // counted before (and regardless of) the wire handshake.
       const t = await connectSocketTransport(endpoint);
-      await waitFor(() => broker.connectedClientCount === 1, 2_000, "clientCount 0→1 on connect");
+      await waitFor(() => serverProxy.connectedClientCount === 1, 2_000, "clientCount 0→1 on connect");
 
       // Disconnect — count drops and the hysteresis window restarts.
       t.close();
-      await waitFor(() => broker.connectedClientCount === 0, 2_000, "clientCount 1→0 on disconnect");
+      await waitFor(() => serverProxy.connectedClientCount === 0, 2_000, "clientCount 1→0 on disconnect");
 
-      // Idle window elapses → broker self-exits and unlinks its socket.
+      // Idle window elapses → server-proxy self-exits and unlinks its socket.
       await waitFor(() => exits.length > 0, 3_000, "idle self-exit");
       assert.deepEqual(exits, ["idle"]);
       assert.equal(
@@ -889,60 +889,60 @@ describe("broker – self-exit: idle hysteresis (tc-3iv)", () => {
 
       // A subsequent spawn on the same socket name + runtime dir must succeed
       // (no EADDRINUSE from a leftover socket file) and must accept clients.
-      const broker2 = createBroker({ socketName, runtimeDir, idleExitMs: 60_000 });
+      const broker2 = createServerProxy({ socketName, runtimeDir, idleExitMs: 60_000 });
       try {
         await broker2.start();
         assert.equal(broker2.endpoint(), endpoint, "respawn binds the same well-known path");
         const t2 = await connectSocketTransport(broker2.endpoint());
-        await waitFor(() => broker2.connectedClientCount === 1, 2_000, "respawned broker accepts clients");
+        await waitFor(() => broker2.connectedClientCount === 1, 2_000, "respawned server-proxy accepts clients");
         t2.close();
       } finally {
         await broker2.shutdown();
       }
     } finally {
-      await broker.shutdown(); // idempotent after self-exit
+      await serverProxy.shutdown(); // idempotent after self-exit
       fs.rmSync(runtimeDir, { recursive: true, force: true });
     }
   });
 
-  it("S2: connected-but-idle client keeps the broker alive past the hysteresis window", async () => {
+  it("S2: connected-but-idle client keeps the server-proxy alive past the hysteresis window", async () => {
     const socketName = nextSocketName();
     const runtimeDir = makeRuntimeDir("s2");
-    const broker = createBroker({ socketName, runtimeDir, idleExitMs: 400 });
-    const exits: BrokerSelfExitReason[] = [];
-    broker.onSelfExit((reason) => exits.push(reason));
-    await broker.start();
-    const endpoint = broker.endpoint();
+    const serverProxy = createServerProxy({ socketName, runtimeDir, idleExitMs: 400 });
+    const exits: ServerProxySelfExitReason[] = [];
+    serverProxy.onSelfExit((reason) => exits.push(reason));
+    await serverProxy.start();
+    const endpoint = serverProxy.endpoint();
 
     try {
       // Connect and then do nothing — no handshake, no commands.  A
-      // connected-but-idle client must keep the broker alive (§6.2: "client"
+      // connected-but-idle client must keep the server-proxy alive (§6.2: "client"
       // is NOT "has bound a terminal" or "has claimed a session").
       const t = await connectSocketTransport(endpoint);
-      await waitFor(() => broker.connectedClientCount === 1, 2_000, "clientCount 0→1 on connect");
+      await waitFor(() => serverProxy.connectedClientCount === 1, 2_000, "clientCount 0→1 on connect");
 
       // Sit idle for well over the hysteresis window.
       await new Promise((r) => setTimeout(r, 1_000));
 
-      assert.equal(exits.length, 0, "broker must NOT self-exit while a client is connected");
+      assert.equal(exits.length, 0, "server-proxy must NOT self-exit while a client is connected");
       assert.ok(fs.existsSync(endpoint), "socket file must still exist");
-      assert.equal(broker.connectedClientCount, 1, "client still counted");
+      assert.equal(serverProxy.connectedClientCount, 1, "client still counted");
 
       t.close();
-      await waitFor(() => broker.connectedClientCount === 0, 2_000, "clientCount 1→0 on disconnect");
+      await waitFor(() => serverProxy.connectedClientCount === 0, 2_000, "clientCount 1→0 on disconnect");
     } finally {
-      await broker.shutdown();
+      await serverProxy.shutdown();
       fs.rmSync(runtimeDir, { recursive: true, force: true });
     }
   });
 });
 
-describe("broker – self-exit: tmux death & watcher respawn (tc-3iv, requires tmux)", { skip: !TMUX_AVAILABLE }, () => {
-  it("S3: tmux kill-server → broker self-exits within 2s and unlinks its socket", async () => {
+describe("server-proxy – self-exit: tmux death & watcher respawn (tc-3iv, requires tmux)", { skip: !TMUX_AVAILABLE }, () => {
+  it("S3: tmux kill-server → server-proxy self-exits within 2s and unlinks its socket", async () => {
     const socketName = nextSocketName();
     const runtimeDir = makeRuntimeDir("s3");
 
-    // Seed a session FIRST so the broker's thin -CC watcher can attach.
+    // Seed a session FIRST so the server-proxy's thin -CC watcher can attach.
     const seeded = spawnSync("tmux", ["-L", socketName, "new-session", "-d", "-s", "seed"], {
       encoding: "utf8",
       timeout: 10_000,
@@ -950,15 +950,15 @@ describe("broker – self-exit: tmux death & watcher respawn (tc-3iv, requires t
     assert.equal(seeded.status, 0, `tmux new-session failed: ${seeded.stderr}`);
 
     // Long idle window so only the tmux-death path can trigger exit.
-    const broker = createBroker({ socketName, runtimeDir, idleExitMs: 600_000 });
-    const exits: BrokerSelfExitReason[] = [];
+    const serverProxy = createServerProxy({ socketName, runtimeDir, idleExitMs: 600_000 });
+    const exits: ServerProxySelfExitReason[] = [];
     let exitedAt = 0;
-    broker.onSelfExit((reason) => {
+    serverProxy.onSelfExit((reason) => {
       exits.push(reason);
       exitedAt = Date.now();
     });
-    await broker.start();
-    const endpoint = broker.endpoint();
+    await serverProxy.start();
+    const endpoint = serverProxy.endpoint();
 
     try {
       // The exit trigger is watcher EOF — wait for the watcher to be attached.
@@ -975,13 +975,13 @@ describe("broker – self-exit: tmux death & watcher respawn (tc-3iv, requires t
       );
       assert.equal(fs.existsSync(endpoint), false, "socket file must be unlinked on self-exit");
     } finally {
-      await broker.shutdown(); // idempotent after self-exit
+      await serverProxy.shutdown(); // idempotent after self-exit
       spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
       fs.rmSync(runtimeDir, { recursive: true, force: true });
     }
   });
 
-  it("S4: watcher SIGKILLed while tmux alive → watcher respawned, broker stays up", async () => {
+  it("S4: watcher SIGKILLed while tmux alive → watcher respawned, server-proxy stays up", async () => {
     const socketName = nextSocketName();
     const runtimeDir = makeRuntimeDir("s4");
 
@@ -991,11 +991,11 @@ describe("broker – self-exit: tmux death & watcher respawn (tc-3iv, requires t
     });
     assert.equal(seeded.status, 0, `tmux new-session failed: ${seeded.stderr}`);
 
-    const broker = createBroker({ socketName, runtimeDir, idleExitMs: 600_000 });
-    const exits: BrokerSelfExitReason[] = [];
-    broker.onSelfExit((reason) => exits.push(reason));
-    await broker.start();
-    const endpoint = broker.endpoint();
+    const serverProxy = createServerProxy({ socketName, runtimeDir, idleExitMs: 600_000 });
+    const exits: ServerProxySelfExitReason[] = [];
+    serverProxy.onSelfExit((reason) => exits.push(reason));
+    await serverProxy.start();
+    const endpoint = serverProxy.endpoint();
 
     try {
       await waitFor(() => findWatcherPids(socketName).length > 0, 5_000, "initial watcher attach");
@@ -1004,21 +1004,21 @@ describe("broker – self-exit: tmux death & watcher respawn (tc-3iv, requires t
       // Kill ONLY the watcher process; the tmux server stays alive.
       process.kill(pid1, "SIGKILL");
 
-      // The broker must probe (tmux alive) and respawn a fresh watcher —
+      // The server-proxy must probe (tmux alive) and respawn a fresh watcher —
       // and must NOT exit.
       await waitFor(
         () => findWatcherPids(socketName).some((p) => p !== pid1),
         5_000,
         "watcher respawn with a new pid",
       );
-      assert.equal(exits.length, 0, "broker must NOT self-exit when only the watcher died");
-      assert.ok(fs.existsSync(endpoint), "broker socket must still exist");
+      assert.equal(exits.length, 0, "server-proxy must NOT self-exit when only the watcher died");
+      assert.ok(fs.existsSync(endpoint), "server-proxy socket must still exist");
 
-      // Broker must still be serving: a fresh client can connect.
+      // ServerProxy must still be serving: a fresh client can connect.
       const t = await connectSocketTransport(endpoint);
-      await waitFor(() => broker.connectedClientCount === 1, 2_000, "broker still accepts clients");
+      await waitFor(() => serverProxy.connectedClientCount === 1, 2_000, "server-proxy still accepts clients");
       t.close();
-      await waitFor(() => broker.connectedClientCount === 0, 2_000, "client disconnect observed");
+      await waitFor(() => serverProxy.connectedClientCount === 0, 2_000, "client disconnect observed");
 
       // The RESPAWNED watcher must still drive the tmux-death exit path.
       spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
@@ -1026,7 +1026,7 @@ describe("broker – self-exit: tmux death & watcher respawn (tc-3iv, requires t
       assert.deepEqual(exits, ["tmux-gone"]);
       assert.equal(fs.existsSync(endpoint), false, "socket file must be unlinked on self-exit");
     } finally {
-      await broker.shutdown(); // idempotent after self-exit
+      await serverProxy.shutdown(); // idempotent after self-exit
       spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
       fs.rmSync(runtimeDir, { recursive: true, force: true });
     }

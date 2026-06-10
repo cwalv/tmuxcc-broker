@@ -1,40 +1,40 @@
 /**
- * daemon-crash-respawn.test.ts — tc-ukq acceptance: a session daemon dies
- * unexpectedly while the broker survives (ext-a-design-context.md §6.3
+ * session-proxy-crash-respawn.test.ts — tc-ukq acceptance: a session session-proxy dies
+ * unexpectedly while the server-proxy survives (ext-a-design-context.md §6.3
  * "Crash while the server-proxy lives").
  *
  * # Scenario (C1, two sessions)
  *
- * In-process broker (so the daemons are direct children of THIS test
+ * In-process serverProxy (so the daemons are direct children of THIS test
  * process and can be located + SIGKILLed), two claimed sessions A and B,
- * one daemon-wire client attached to each.  SIGKILL daemon A:
+ * one session-proxy-wire client attached to each.  SIGKILL session-proxy A:
  *
- *   a. A's attached client sees its daemon connection CLOSE — the
- *      session-scoped disconnect (per SCHEMA.md "Daemon errors": a dead
- *      daemon connection means reconnect via broker).  NOT broker-wide:
+ *   a. A's attached client sees its session-proxy connection CLOSE — the
+ *      session-scoped disconnect (per SCHEMA.md "SessionProxy errors": a dead
+ *      session-proxy connection means reconnect via serverProxy).  NOT server-proxy-wide:
  *      B's client connection stays open.
- *   b. The broker does NOT broadcast `sessions.removed` for A — the tmux
- *      session is still alive; only the daemon died.
- *   c. Respawn is LAZY (§6.2): no new daemon appears until the next claim.
- *   d. The broker itself keeps serving (no self-exit, no restart): the
- *      ORIGINAL broker-wire connection performs the re-claim.
+ *   b. The server-proxy does NOT broadcast `sessions.removed` for A — the tmux
+ *      session is still alive; only the session-proxy died.
+ *   c. Respawn is LAZY (§6.2): no new session-proxy appears until the next claim.
+ *   d. The server-proxy itself keeps serving (no self-exit, no restart): the
+ *      ORIGINAL server-proxy-wire connection performs the re-claim.
  *   e. Re-claim of A returns the same sessionId + endpoint and a FRESH
- *      daemon process (new pid) whose `-CC attach` works: a daemon-wire
- *      handshake + snapshot round-trip succeeds against the new daemon.
- *   f. Sibling session B is untouched throughout: same daemon pid, its
+ *      session-proxy process (new pid) whose `-CC attach` works: a session-proxy-wire
+ *      handshake + snapshot round-trip succeeds against the new session-proxy.
+ *   f. Sibling session B is untouched throughout: same session-proxy pid, its
  *      client connection never closes, and a live resync.request →
  *      snapshot round-trip succeeds after the crash.
  *
  * # Cleanup
  *
  * Unique tmux socket name (tmuxcc-test-crash-…) + unique runtime dir per
- * run.  The finally block closes all transports, shuts the broker down
- * (reaping its daemon children), SIGKILLs any daemon pid this test saw,
+ * run.  The finally block closes all transports, shuts the server-proxy down
+ * (reaping its session-proxy children), SIGKILLs any session-proxy pid this test saw,
  * kills the tmux test server, pkills anything still holding the unique
  * socket name in argv, and removes the runtime dir — even on assertion
  * failure.
  *
- * @module daemon-crash-respawn.test
+ * @module session-proxy-crash-respawn.test
  */
 
 import { describe, it } from "node:test";
@@ -44,16 +44,16 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { createBroker, connectSocketTransport } from "./index.js";
-import type { BrokerSelfExitReason } from "./index.js";
-import { runClientHandshake, WIRE_PROTOCOL_VERSION } from "@tmuxcc/daemon";
+import { createServerProxy, connectSocketTransport } from "./index.js";
+import type { ServerProxySelfExitReason } from "./index.js";
+import { runClientHandshake, WIRE_PROTOCOL_VERSION } from "@tmuxcc/session-proxy";
 import type {
   Transport,
   Capabilities,
-  BrokerSnapshotMessage,
-  BrokerCommandResponseMessage,
+  ServerProxySnapshotMessage,
+  ServerProxyCommandResponseMessage,
   MessageBase,
-} from "@tmuxcc/daemon";
+} from "@tmuxcc/session-proxy";
 
 // ---------------------------------------------------------------------------
 // Guards + small helpers
@@ -103,13 +103,13 @@ function killQuiet(pid: number | undefined): void {
 }
 
 /**
- * Find the daemon process for a session: a direct child of THIS test
- * process (the broker runs in-process, so the supervisor's children are
+ * Find the session-proxy process for a session: a direct child of THIS test
+ * process (the server-proxy runs in-process, so the supervisor's children are
  * ours) whose argv carries this test's unique socket name AND the session
- * name — the supervisor spawns daemon-entry with
+ * name — the supervisor spawns session-proxy-entry with
  * `--socket-name <socketName> --session-name <sessionName>`.
  */
-function findDaemonPid(socketName: string, sessionName: string): number | undefined {
+function findSessionProxyPid(socketName: string, sessionName: string): number | undefined {
   // NB: the pattern must not start with "-" or pgrep parses it as an option.
   const r = spawnSync(
     "pgrep",
@@ -117,7 +117,7 @@ function findDaemonPid(socketName: string, sessionName: string): number | undefi
       "-P",
       String(process.pid),
       "-f",
-      `daemon-entry.*--socket-name ${socketName} --session-name ${sessionName} --socket-path`,
+      `session-proxy-entry.*--socket-name ${socketName} --session-name ${sessionName} --socket-path`,
     ],
     { encoding: "utf8", timeout: 3_000 },
   );
@@ -127,7 +127,7 @@ function findDaemonPid(socketName: string, sessionName: string): number | undefi
 }
 
 // ---------------------------------------------------------------------------
-// Wire helpers (minimal versions of the broker.test.ts harness)
+// Wire helpers (minimal versions of the server-proxy.test.ts harness)
 // ---------------------------------------------------------------------------
 
 const CLIENT_CAPS: Capabilities = {
@@ -135,7 +135,7 @@ const CLIENT_CAPS: Capabilities = {
   features: ["sessions-watch", "session-create", "session-destroy", "session-claim", "pane-attach"],
 };
 
-const DAEMON_CLIENT_CAPS: Capabilities = {
+const SESSION_PROXY_CLIENT_CAPS: Capabilities = {
   protocolVersion: WIRE_PROTOCOL_VERSION,
   features: ["pane-lifecycle", "layout-updates", "focus-events", "input-forwarding"],
 };
@@ -181,25 +181,25 @@ class TransportMux {
   }
 }
 
-/** Connect + handshake on the broker wire; consume the initial snapshot. */
-async function connectToBroker(endpoint: string): Promise<TransportMux> {
+/** Connect + handshake on the server-proxy wire; consume the initial snapshot. */
+async function connectToServerProxy(endpoint: string): Promise<TransportMux> {
   const transport = await connectSocketTransport(endpoint);
   // Handshake FIRST: it installs and then clears its own onControl handler;
   // the mux must be installed after so its handler wins the single slot.
-  await runClientHandshake(transport, CLIENT_CAPS, "broker.capabilities");
+  await runClientHandshake(transport, CLIENT_CAPS, "server-proxy.capabilities");
   const mux = new TransportMux(transport);
-  await mux.next<BrokerSnapshotMessage>("sessions.snapshot", 5_000, "broker snapshot");
+  await mux.next<ServerProxySnapshotMessage>("sessions.snapshot", 5_000, "server-proxy snapshot");
   return mux;
 }
 
-/** Send a broker command and await the correlated response. */
-async function sendBrokerCommand(
+/** Send a server-proxy command and await the correlated response. */
+async function sendServerProxyCommand(
   mux: TransportMux,
   command: { kind: string; [k: string]: unknown },
   outgoingSeq: { value: number },
-): Promise<BrokerCommandResponseMessage> {
+): Promise<ServerProxyCommandResponseMessage> {
   const correlationId = `corr-${Math.random().toString(36).slice(2)}`;
-  const responsePromise = new Promise<BrokerCommandResponseMessage>((resolve, reject) => {
+  const responsePromise = new Promise<ServerProxyCommandResponseMessage>((resolve, reject) => {
     const timer = setTimeout(() => {
       unsub();
       reject(new Error(`Timeout waiting for ${command.kind} response`));
@@ -208,11 +208,11 @@ async function sendBrokerCommand(
     const unsub = mux.subscribe((msg) => {
       if (
         msg.type === "command.response" &&
-        (msg as unknown as BrokerCommandResponseMessage).correlationId === correlationId
+        (msg as unknown as ServerProxyCommandResponseMessage).correlationId === correlationId
       ) {
         clearTimeout(timer);
         unsub();
-        resolve(msg as unknown as BrokerCommandResponseMessage);
+        resolve(msg as unknown as ServerProxyCommandResponseMessage);
       }
     });
   });
@@ -225,35 +225,35 @@ async function sendBrokerCommand(
   return responsePromise;
 }
 
-/** Claim a session via the broker wire; assert success; return the payload. */
+/** Claim a session via the server-proxy wire; assert success; return the payload. */
 async function claim(
   mux: TransportMux,
   name: string,
   seq: { value: number },
 ): Promise<{ sessionId: string; endpoint: string }> {
-  const resp = await sendBrokerCommand(mux, { kind: "session.claim", name }, seq);
+  const resp = await sendServerProxyCommand(mux, { kind: "session.claim", name }, seq);
   assert.ok(resp.result.ok, `session.claim '${name}' failed: ${JSON.stringify(resp.result)}`);
   return (resp.result as { ok: true; payload: { sessionId: string; endpoint: string } }).payload;
 }
 
-/** Daemon-wire snapshot shape (the fields this test asserts on). */
-interface DaemonSnapshot {
+/** SessionProxy-wire snapshot shape (the fields this test asserts on). */
+interface SessionProxySnapshot {
   type: "snapshot";
   session: { sessionId: string; name: string };
 }
 
 /**
- * Connect to a daemon endpoint, handshake, and await the initial snapshot —
+ * Connect to a session-proxy endpoint, handshake, and await the initial snapshot —
  * proof of a working `-CC attach` (the snapshot is built from tmux state).
  * Returns the mux, the snapshot, and a closed() probe fed by onClose.
  */
-async function connectToDaemon(endpoint: string): Promise<{
+async function connectToSessionProxy(endpoint: string): Promise<{
   mux: TransportMux;
-  snapshot: DaemonSnapshot;
+  snapshot: SessionProxySnapshot;
   closed: () => boolean;
 }> {
   const transport = await connectSocketTransport(endpoint);
-  await runClientHandshake(transport, DAEMON_CLIENT_CAPS, "daemon.capabilities");
+  await runClientHandshake(transport, SESSION_PROXY_CLIENT_CAPS, "session-proxy.capabilities");
   // onClose is single-slot like onControl, and runClientHandshake installs
   // (then no-ops) its own handler — install ours AFTER the handshake.
   let isClosed = false;
@@ -261,7 +261,7 @@ async function connectToDaemon(endpoint: string): Promise<{
     isClosed = true;
   });
   const mux = new TransportMux(transport);
-  const snapshot = await mux.next<DaemonSnapshot>("snapshot", 10_000, "daemon snapshot");
+  const snapshot = await mux.next<SessionProxySnapshot>("snapshot", 10_000, "session-proxy snapshot");
   return { mux, snapshot, closed: () => isClosed };
 }
 
@@ -270,11 +270,11 @@ async function connectToDaemon(endpoint: string): Promise<{
 // ---------------------------------------------------------------------------
 
 describe(
-  "tc-ukq: daemon crash → reap + lazy respawn on next claim (requires tmux)",
+  "tc-ukq: session-proxy crash → reap + lazy respawn on next claim (requires tmux)",
   { skip: !TMUX_AVAILABLE ? "tmux not found on PATH" : false },
   () => {
     it(
-      "C1: SIGKILL daemon A → A's client disconnected (session-scoped); no sessions.removed; lazy fresh daemon on re-claim; broker + sibling B unaffected",
+      "C1: SIGKILL session-proxy A → A's client disconnected (session-scoped); no sessions.removed; lazy fresh session-proxy on re-claim; server-proxy + sibling B unaffected",
       { timeout: 60_000 },
       async () => {
         const socketName = `tmuxcc-test-crash-${process.pid}-${Date.now()}`;
@@ -282,10 +282,10 @@ describe(
         const nameA = "crash-a";
         const nameB = "crash-b";
 
-        // Long idle window: only an unexpected lifecycle event could exit the broker.
-        const broker = createBroker({ socketName, runtimeDir, idleExitMs: 600_000 });
-        const selfExits: BrokerSelfExitReason[] = [];
-        broker.onSelfExit((reason) => selfExits.push(reason));
+        // Long idle window: only an unexpected lifecycle event could exit the server-proxy.
+        const serverProxy = createServerProxy({ socketName, runtimeDir, idleExitMs: 600_000 });
+        const selfExits: ServerProxySelfExitReason[] = [];
+        serverProxy.onSelfExit((reason) => selfExits.push(reason));
 
         let pidA1: number | undefined;
         let pidA2: number | undefined;
@@ -293,114 +293,114 @@ describe(
         const transports: Transport[] = [];
 
         try {
-          await broker.start();
-          const brokerEndpoint = broker.endpoint();
+          await serverProxy.start();
+          const serverProxyEndpoint = serverProxy.endpoint();
 
-          // ── Arrange: one broker client, two claimed sessions, one daemon-
-          // wire client attached to each session's daemon. ───────────────────
-          const brokerMux = await connectToBroker(brokerEndpoint);
-          transports.push(brokerMux.transport);
+          // ── Arrange: one server-proxy client, two claimed sessions, one session-proxy-
+          // wire client attached to each session's session-proxy. ───────────────────
+          const serverProxyMux = await connectToServerProxy(serverProxyEndpoint);
+          transports.push(serverProxyMux.transport);
           const seq = { value: 1 };
 
-          // Record every sessions.removed the broker broadcasts on this
+          // Record every sessions.removed the server-proxy broadcasts on this
           // connection — assertion (b) checks A never appears.
           const removedIds: string[] = [];
-          brokerMux.subscribe((msg) => {
+          serverProxyMux.subscribe((msg) => {
             if (msg.type === "sessions.removed") {
               removedIds.push((msg as unknown as { sessionId: string }).sessionId);
             }
           });
 
-          const claimA1 = await claim(brokerMux, nameA, seq);
-          const claimB = await claim(brokerMux, nameB, seq);
+          const claimA1 = await claim(serverProxyMux, nameA, seq);
+          const claimB = await claim(serverProxyMux, nameB, seq);
 
-          pidA1 = findDaemonPid(socketName, nameA);
-          pidB = findDaemonPid(socketName, nameB);
-          assert.ok(pidA1 !== undefined, "daemon A pid must be discoverable after claim");
-          assert.ok(pidB !== undefined, "daemon B pid must be discoverable after claim");
-          assert.ok(alive(pidA1), "sanity: daemon A alive");
-          assert.ok(alive(pidB), "sanity: daemon B alive");
+          pidA1 = findSessionProxyPid(socketName, nameA);
+          pidB = findSessionProxyPid(socketName, nameB);
+          assert.ok(pidA1 !== undefined, "session-proxy A pid must be discoverable after claim");
+          assert.ok(pidB !== undefined, "session-proxy B pid must be discoverable after claim");
+          assert.ok(alive(pidA1), "sanity: session-proxy A alive");
+          assert.ok(alive(pidB), "sanity: session-proxy B alive");
 
-          const clientA = await connectToDaemon(claimA1.endpoint);
+          const clientA = await connectToSessionProxy(claimA1.endpoint);
           transports.push(clientA.mux.transport);
-          assert.equal(clientA.snapshot.session.name, nameA, "daemon A serves session A");
+          assert.equal(clientA.snapshot.session.name, nameA, "session-proxy A serves session A");
 
-          const clientB = await connectToDaemon(claimB.endpoint);
+          const clientB = await connectToSessionProxy(claimB.endpoint);
           transports.push(clientB.mux.transport);
-          assert.equal(clientB.snapshot.session.name, nameB, "daemon B serves session B");
+          assert.equal(clientB.snapshot.session.name, nameB, "session-proxy B serves session B");
 
-          // ── Act: the daemon dies unexpectedly (stand-in for parser fault /
+          // ── Act: the session-proxy dies unexpectedly (stand-in for parser fault /
           // OOM — SIGKILL gives it no chance to clean up). ───────────────────
           process.kill(pidA1, "SIGKILL");
 
           // ── Assert (a): session-scoped disconnect — A's attached client
-          // sees its daemon connection close; B's stays open. ────────────────
-          await waitFor(clientA.closed, 5_000, "daemon-wire close on session A's client");
+          // sees its session-proxy connection close; B's stays open. ────────────────
+          await waitFor(clientA.closed, 5_000, "session-proxy-wire close on session A's client");
           assert.equal(
             clientB.closed(),
             false,
-            "sibling session B's daemon-wire connection must stay open (NOT broker-wide teardown)",
+            "sibling session B's session-proxy-wire connection must stay open (NOT server-proxy-wide teardown)",
           );
 
           // ── Assert (c): respawn is LAZY (§6.2) — with no new claim, the
-          // crashed daemon stays gone.  Settle long enough for any (buggy)
+          // crashed session-proxy stays gone.  Settle long enough for any (buggy)
           // eager-respawn path to have produced a process. ───────────────────
           await sleep(750);
           assert.equal(
-            findDaemonPid(socketName, nameA),
+            findSessionProxyPid(socketName, nameA),
             undefined,
-            "no daemon may be respawned for A before the next session.claim (lazy respawn)",
+            "no session-proxy may be respawned for A before the next session.claim (lazy respawn)",
           );
 
           // ── Assert (b): no sessions.removed for A — the tmux session is
-          // alive; only its daemon died.  (B must not be removed either.) ────
+          // alive; only its session-proxy died.  (B must not be removed either.) ────
           assert.deepEqual(
             removedIds,
             [],
-            `broker must not broadcast sessions.removed on a daemon crash; got ${JSON.stringify(removedIds)}`,
+            `server-proxy must not broadcast sessions.removed on a session-proxy crash; got ${JSON.stringify(removedIds)}`,
           );
           const hasA = spawnSync("tmux", ["-L", socketName, "has-session", "-t", nameA], {
             stdio: "ignore",
             timeout: 5_000,
           });
-          assert.equal(hasA.status, 0, "tmux session A must survive its daemon's death");
+          assert.equal(hasA.status, 0, "tmux session A must survive its session-proxy's death");
 
-          // ── Assert (d): the broker never restarted — no self-exit, socket
-          // still bound, and the ORIGINAL broker-wire connection performs the
+          // ── Assert (d): the server-proxy never restarted — no self-exit, socket
+          // still bound, and the ORIGINAL server-proxy-wire connection performs the
           // re-claim below. ──────────────────────────────────────────────────
-          assert.deepEqual(selfExits, [], "broker must not self-exit on a daemon crash");
-          assert.ok(fs.existsSync(brokerEndpoint), "broker socket must still exist");
+          assert.deepEqual(selfExits, [], "server-proxy must not self-exit on a session-proxy crash");
+          assert.ok(fs.existsSync(serverProxyEndpoint), "server-proxy socket must still exist");
 
-          // ── Assert (e): re-claim → same identity, FRESH daemon, working
+          // ── Assert (e): re-claim → same identity, FRESH sessionProxy, working
           // -CC attach. ──────────────────────────────────────────────────────
-          const claimA2 = await claim(brokerMux, nameA, seq);
+          const claimA2 = await claim(serverProxyMux, nameA, seq);
           assert.equal(claimA2.sessionId, claimA1.sessionId, "sessionId must be stable across the respawn");
           assert.equal(claimA2.endpoint, claimA1.endpoint, "endpoint path must be stable across the respawn");
 
-          pidA2 = findDaemonPid(socketName, nameA);
-          assert.ok(pidA2 !== undefined, "re-claim must spawn a daemon for A");
-          assert.notEqual(pidA2, pidA1, "re-claim must spawn a FRESH daemon process");
-          assert.ok(alive(pidA2), "fresh daemon A must be alive");
+          pidA2 = findSessionProxyPid(socketName, nameA);
+          assert.ok(pidA2 !== undefined, "re-claim must spawn a session-proxy for A");
+          assert.notEqual(pidA2, pidA1, "re-claim must spawn a FRESH session-proxy process");
+          assert.ok(alive(pidA2), "fresh session-proxy A must be alive");
 
-          const clientA2 = await connectToDaemon(claimA2.endpoint);
+          const clientA2 = await connectToSessionProxy(claimA2.endpoint);
           transports.push(clientA2.mux.transport);
           assert.equal(
             clientA2.snapshot.session.name,
             nameA,
-            "fresh daemon must serve a snapshot for the SAME surviving tmux session",
+            "fresh session-proxy must serve a snapshot for the SAME surviving tmux session",
           );
           assert.equal(
             clientA2.snapshot.session.sessionId,
             claimA1.sessionId,
-            "fresh daemon snapshot must carry the stable sessionId",
+            "fresh session-proxy snapshot must carry the stable sessionId",
           );
 
           // ── Assert (f): sibling B fully functional after the whole dance —
           // same pid, connection open, live resync round-trip. ──────────────
-          assert.equal(findDaemonPid(socketName, nameB), pidB, "daemon B pid unchanged");
-          assert.ok(alive(pidB), "daemon B still alive");
-          assert.equal(clientB.closed(), false, "B's daemon-wire connection still open");
-          const bResync = clientB.mux.next<DaemonSnapshot>("snapshot", 5_000, "B resync snapshot");
+          assert.equal(findSessionProxyPid(socketName, nameB), pidB, "session-proxy B pid unchanged");
+          assert.ok(alive(pidB), "session-proxy B still alive");
+          assert.equal(clientB.closed(), false, "B's session-proxy-wire connection still open");
+          const bResync = clientB.mux.next<SessionProxySnapshot>("snapshot", 5_000, "B resync snapshot");
           clientB.mux.transport.sendControl({
             type: "resync.request",
             seq: 2,
@@ -413,7 +413,7 @@ describe(
             try { t.close(); } catch { /* already closed */ }
           }
           try {
-            await broker.shutdown(); // reaps daemon children, unlinks socket
+            await serverProxy.shutdown(); // reaps session-proxy children, unlinks socket
           } catch { /* already down */ }
           killQuiet(pidA1);
           killQuiet(pidA2);

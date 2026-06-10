@@ -27,7 +27,7 @@
  *       (printable ASCII ⇒ ~540 MB) → `_buf.length < totalLen` forever →
  *       inbound processing SILENTLY stalled while the socket stayed open.
  *       Outbound sends kept working, so commands still reached tmux while
- *       every daemon→client delta vanished: exactly the tc-3y8.9 symptom
+ *       every session-proxy→client delta vanished: exactly the tc-3y8.9 symptom
  *       (bootstrap snapshot delivered — it precedes data-plane traffic — but
  *       live pane.opened/closed deltas never arrive).
  *
@@ -45,8 +45,8 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
-import { encodeFrame, paneId } from "@tmuxcc/daemon";
-import type { Transport, PaneId } from "@tmuxcc/daemon";
+import { encodeFrame, paneId } from "@tmuxcc/session-proxy";
+import type { Transport, PaneId } from "@tmuxcc/session-proxy";
 import { createSocketServer } from "./socket-transport.js";
 
 // ---------------------------------------------------------------------------

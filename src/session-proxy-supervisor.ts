@@ -1,21 +1,21 @@
 /**
- * Daemon supervisor — manages per-session daemon child processes.
+ * SessionProxy supervisor — manages per-session session-proxy child processes.
  *
  * # Responsibility
  *
- * The supervisor owns the lifecycle of per-session daemon processes:
- *   - Spawning a daemon for a session (if one is not already running)
- *   - Waiting for the daemon to signal readiness
+ * The supervisor owns the lifecycle of per-session session-proxy processes:
+ *   - Spawning a session-proxy for a session (if one is not already running)
+ *   - Waiting for the session-proxy to signal readiness
  *   - Reaping daemons on session removal or unexpected exit
  *   - Per-name atomicity: concurrent claim requests for the same session name
- *     are serialized so only one daemon process is ever spawned
+ *     are serialized so only one session-proxy process is ever spawned
  *
- * # Daemon entry point
+ * # SessionProxy entry point
  *
- * The supervisor spawns Node.js running the daemon entry script
- * `src/daemon-entry.js` (compiled from daemon-entry.ts in this package).
+ * The supervisor spawns Node.js running the session-proxy entry script
+ * `src/session-proxy-entry.js` (compiled from session-proxy-entry.ts in this package).
  * The entry script accepts `--socket-name`, `--session-name`, and
- * `--socket-path` arguments and writes "READY\n" to stdout once the daemon
+ * `--socket-path` arguments and writes "READY\n" to stdout once the session-proxy
  * is listening.
  *
  * # Data-plane endpoint convention
@@ -25,10 +25,10 @@
  * tmuxcc-daemon's framing.ts). The endpoint string IS the multiplexed socket."
  *
  * The endpoint returned by the supervisor IS the unix socket path on which the
- * daemon listens for both control-plane (JSON) and data-plane (0xCC) traffic.
+ * session-proxy listens for both control-plane (JSON) and data-plane (0xCC) traffic.
  * Clients do not need a separate data socket.
  *
- * @module daemon-supervisor
+ * @module session-proxy-supervisor
  */
 
 import { spawn, type ChildProcess } from "node:child_process";
@@ -39,15 +39,15 @@ import { join, dirname } from "node:path";
 // Types
 // ---------------------------------------------------------------------------
 
-/** A running daemon entry. */
-interface DaemonEntry {
-  /** The unix socket path the daemon is listening on. */
+/** A running session-proxy entry. */
+interface SessionProxyEntry {
+  /** The unix socket path the session-proxy is listening on. */
   socketPath: string;
-  /** Stable broker-assigned session id. */
+  /** Stable server-proxy-assigned session id. */
   sessionId: string;
-  /** The daemon child process. */
+  /** The session-proxy child process. */
   proc: ChildProcess;
-  /** Promise that resolves once the daemon is ready. */
+  /** Promise that resolves once the session-proxy is ready. */
   ready: Promise<string>;
 }
 
@@ -55,27 +55,27 @@ interface DaemonEntry {
  * Exit details passed to the crash handler. `code`/`signal` come from the
  * child's `exit` event — exactly one of them is non-null.
  */
-export interface DaemonExitInfo {
-  /** Session name the daemon was bound to (for logging). */
+export interface SessionProxyExitInfo {
+  /** Session name the session-proxy was bound to (for logging). */
   sessionName: string;
-  /** Exit code, or null if the daemon was killed by a signal. */
+  /** Exit code, or null if the session-proxy was killed by a signal. */
   code: number | null;
-  /** Terminating signal (e.g. "SIGKILL"), or null if the daemon exited on its own. */
+  /** Terminating signal (e.g. "SIGKILL"), or null if the session-proxy exited on its own. */
   signal: NodeJS.Signals | null;
 }
 
 /**
- * Called when a daemon exits UNEXPECTEDLY (ext-a §6.3 "Crash while the
- * server-proxy lives").  Intentional reaps (reapDaemon / reapAll) delete the
+ * Called when a session-proxy exits UNEXPECTEDLY (ext-a §6.3 "Crash while the
+ * server-proxy lives").  Intentional reaps (reapSessionProxy / reapAll) delete the
  * registry entry before killing and therefore never reach this handler.
  * By the time the handler runs, the supervisor has already reaped the
- * sessionId → daemon registry entry, so the next ensureDaemon() for the
- * session spawns a fresh daemon.
+ * sessionId → session-proxy registry entry, so the next ensureSessionProxy() for the
+ * session spawns a fresh session-proxy.
  */
-export type DaemonCrashHandler = (sessionId: string, info: DaemonExitInfo) => void;
+export type SessionProxyCrashHandler = (sessionId: string, info: SessionProxyExitInfo) => void;
 
 // ---------------------------------------------------------------------------
-// Path to the daemon entry script
+// Path to the session-proxy entry script
 // ---------------------------------------------------------------------------
 
 const __dir = dirname(fileURLToPath(import.meta.url));
@@ -87,24 +87,24 @@ const __dir = dirname(fileURLToPath(import.meta.url));
  * True when the import.meta.url ends with ".ts" (tsx loader presents the
  * original source URL). False when running from a compiled .js dist bundle.
  *
- * Used by both `daemonEntryScript()` and `daemonSpawnArgs()` to match the
+ * Used by both `sessionProxyEntryScript()` and `sessionProxySpawnArgs()` to match the
  * entry-point extension and the `--import tsx` loader flag.
  */
 const _runningFromSource = import.meta.url.endsWith(".ts");
 
 /**
- * Path to the compiled daemon-entry script.
- * In dist/ layout the entry is dist/daemon-entry.js relative to this file.
+ * Path to the compiled session-proxy-entry script.
+ * In dist/ layout the entry is dist/session-proxy-entry.js relative to this file.
  */
-function daemonEntryScript(): string {
-  // When running from dist/ (compiled), daemon-entry.js is a sibling.
-  // When running from src/ via tsx, daemon-entry.ts is a sibling.
+function sessionProxyEntryScript(): string {
+  // When running from dist/ (compiled), session-proxy-entry.js is a sibling.
+  // When running from src/ via tsx, session-proxy-entry.ts is a sibling.
   const ext = _runningFromSource ? ".ts" : ".js";
-  return join(__dir, `daemon-entry${ext}`);
+  return join(__dir, `session-proxy-entry${ext}`);
 }
 
 /**
- * Build the Node.js argument array for spawning the daemon entry script.
+ * Build the Node.js argument array for spawning the session-proxy entry script.
  *
  * In development (TypeScript source, tsx loader): prepend `--import tsx` so
  * the `.ts` entry script can be executed directly.
@@ -113,10 +113,10 @@ function daemonEntryScript(): string {
  * tsx is a devDependency and will not be present in a production install or
  * on a remote host.
  *
- * This mirrors the logic in `daemonEntryScript()` so the two always agree on
+ * This mirrors the logic in `sessionProxyEntryScript()` so the two always agree on
  * whether TypeScript sources or compiled JS files are in use.
  */
-function daemonSpawnArgs(script: string, socketName: string, sessionName: string, socketPath: string): string[] {
+function sessionProxySpawnArgs(script: string, socketName: string, sessionName: string, socketPath: string): string[] {
   const scriptArgs = [
     script,
     "--socket-name", socketName,
@@ -130,73 +130,73 @@ function daemonSpawnArgs(script: string, socketName: string, sessionName: string
 }
 
 // ---------------------------------------------------------------------------
-// DaemonSupervisor
+// SessionProxySupervisor
 // ---------------------------------------------------------------------------
 
-export interface DaemonSupervisor {
+export interface SessionProxySupervisor {
   /**
-   * Ensure a daemon is running for the given session and return its socket path.
+   * Ensure a session-proxy is running for the given session and return its socket path.
    *
-   * If a daemon for `sessionId` is already running, returns its socket path
+   * If a session-proxy for `sessionId` is already running, returns its socket path
    * immediately. If not, spawns one and waits for it to signal readiness.
    *
    * Per-name atomicity: concurrent calls for the same `sessionId` share the
-   * same in-flight spawn promise — only one daemon process is ever spawned.
+   * same in-flight spawn promise — only one session-proxy process is ever spawned.
    */
-  ensureDaemon(
+  ensureSessionProxy(
     sessionId: string,
     sessionName: string,
     socketName: string,
-    daemonSocketPath: string,
+    sessionProxySocketPath: string,
   ): Promise<string>;
 
   /**
-   * PID of the running daemon for `sessionId`, or `null` when no daemon is
+   * PID of the running session-proxy for `sessionId`, or `null` when no session-proxy is
    * running (never claimed, reaped, or crashed) or its spawn is still
-   * in-flight (tc-k6v `broker.info`).  Read-only; never blocks on a spawn.
+   * in-flight (tc-k6v `server-proxy.info`).  Read-only; never blocks on a spawn.
    */
-  daemonPid(sessionId: string): number | null;
+  sessionProxyPid(sessionId: string): number | null;
 
   /**
-   * Kill the daemon for a session (if running). Called on session removal.
+   * Kill the session-proxy for a session (if running). Called on session removal.
    */
-  reapDaemon(sessionId: string): void;
+  reapSessionProxy(sessionId: string): void;
 
   /**
-   * Kill all running daemons. Called on broker shutdown.
+   * Kill all running daemons. Called on server-proxy shutdown.
    */
   reapAll(): void;
 
   /**
-   * Register a handler called when a daemon exits unexpectedly.
+   * Register a handler called when a session-proxy exits unexpectedly.
    */
-  onCrash(handler: DaemonCrashHandler): void;
+  onCrash(handler: SessionProxyCrashHandler): void;
 }
 
 // ---------------------------------------------------------------------------
 // Implementation
 // ---------------------------------------------------------------------------
 
-class DaemonSupervisorImpl implements DaemonSupervisor {
+class SessionProxySupervisorImpl implements SessionProxySupervisor {
   /**
-   * Map from sessionId to running daemon entry (or in-progress spawn promise).
+   * Map from sessionId to running session-proxy entry (or in-progress spawn promise).
    * The value is the entry OR a Promise for the in-flight spawn, allowing
    * per-name serialization.
    */
-  private _daemons = new Map<string, DaemonEntry | Promise<DaemonEntry>>();
-  private _crashHandler: DaemonCrashHandler | null = null;
+  private _daemons = new Map<string, SessionProxyEntry | Promise<SessionProxyEntry>>();
+  private _crashHandler: SessionProxyCrashHandler | null = null;
 
-  onCrash(handler: DaemonCrashHandler): void {
+  onCrash(handler: SessionProxyCrashHandler): void {
     this._crashHandler = handler;
   }
 
-  async ensureDaemon(
+  async ensureSessionProxy(
     sessionId: string,
     sessionName: string,
     socketName: string,
-    daemonSockPath: string,
+    sessionProxySockPath: string,
   ): Promise<string> {
-    // Fast path: daemon already running
+    // Fast path: session-proxy already running
     const existing = this._daemons.get(sessionId);
     if (existing !== undefined) {
       if (existing instanceof Promise) {
@@ -207,18 +207,18 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
       return existing.socketPath;
     }
 
-    // Slow path: spawn a new daemon
-    const spawnPromise = this._spawnDaemon(
+    // Slow path: spawn a new session-proxy
+    const spawnPromise = this._spawnSessionProxy(
       sessionId,
       sessionName,
       socketName,
-      daemonSockPath,
+      sessionProxySockPath,
     );
 
     // Register the promise immediately so concurrent callers share it
     this._daemons.set(sessionId, spawnPromise);
 
-    let entry: DaemonEntry;
+    let entry: SessionProxyEntry;
     try {
       entry = await spawnPromise;
     } catch (err) {
@@ -232,13 +232,13 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
     return entry.socketPath;
   }
 
-  daemonPid(sessionId: string): number | null {
+  sessionProxyPid(sessionId: string): number | null {
     const entry = this._daemons.get(sessionId);
     if (entry === undefined || entry instanceof Promise) return null;
     return entry.proc.pid ?? null;
   }
 
-  reapDaemon(sessionId: string): void {
+  reapSessionProxy(sessionId: string): void {
     const entry = this._daemons.get(sessionId);
     if (!entry) return;
 
@@ -254,7 +254,7 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
 
   reapAll(): void {
     for (const sessionId of this._daemons.keys()) {
-      this.reapDaemon(sessionId);
+      this.reapSessionProxy(sessionId);
     }
   }
 
@@ -262,31 +262,31 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
   // Private helpers
   // ---------------------------------------------------------------------------
 
-  private async _spawnDaemon(
+  private async _spawnSessionProxy(
     sessionId: string,
     sessionName: string,
     socketName: string,
-    daemonSockPath: string,
-  ): Promise<DaemonEntry> {
-    const script = daemonEntryScript();
+    sessionProxySockPath: string,
+  ): Promise<SessionProxyEntry> {
+    const script = sessionProxyEntryScript();
 
     const proc = spawn(
       process.execPath, // node — always the VS Code Remote Server's own Node binary
-      daemonSpawnArgs(script, socketName, sessionName, daemonSockPath),
+      sessionProxySpawnArgs(script, socketName, sessionName, sessionProxySockPath),
       {
         stdio: ["ignore", "pipe", "pipe"],
         // tc-2c5 / ext-a §6.3 invariant: daemons are REGULAR children — never
         // `detached: true`, no PID file, no "find my old daemons" on startup.
-        // Die-with-parent is enforced inside the daemon itself (getppid
-        // watchdog in daemon-entry.ts); recovery from broker death is a fresh
-        // broker spawning fresh daemons, never reclaiming old ones.
+        // Die-with-parent is enforced inside the session-proxy itself (getppid
+        // watchdog in session-proxy-entry.ts); recovery from server-proxy death is a fresh
+        // server-proxy spawning fresh daemons, never reclaiming old ones.
         detached: false,
         env: { ...process.env },
       },
     );
 
-    // Capture stderr so failures aren't opaque. The daemon prints actionable
-    // diagnostics (e.g. "Daemon start failed: …") to stderr before exit;
+    // Capture stderr so failures aren't opaque. The session-proxy prints actionable
+    // diagnostics (e.g. "SessionProxy start failed: …") to stderr before exit;
     // without surfacing it, the supervisor's error is unactionable.
     let stderrBuf = "";
     proc.stderr?.on("data", (chunk: Buffer) => {
@@ -299,7 +299,7 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
       const timeout = setTimeout(() => {
         const stderrTail = stderrBuf.trim();
         reject(new Error(
-          `Daemon for session '${sessionName}' did not signal READY within 30s` +
+          `SessionProxy for session '${sessionName}' did not signal READY within 30s` +
           (stderrTail ? `. stderr: ${stderrTail}` : ""),
         ));
       }, 30_000);
@@ -316,7 +316,7 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
         clearTimeout(timeout);
         const stderrTail = stderrBuf.trim();
         reject(new Error(
-          `Daemon for session '${sessionName}' exited before READY (code=${code})` +
+          `SessionProxy for session '${sessionName}' exited before READY (code=${code})` +
           (stderrTail ? `. stderr: ${stderrTail}` : ""),
         ));
       });
@@ -339,14 +339,14 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
     //
     // tc-ukq (ext-a §6.3 "Crash while the server-proxy lives"): on unexpected
     // exit the registry entry is reaped HERE, synchronously with the exit
-    // event, so the next ensureDaemon() spawns a fresh daemon.  Respawn is
+    // event, so the next ensureSessionProxy() spawns a fresh session-proxy.  Respawn is
     // LAZY (§6.2): nothing is spawned until the next claim.
     proc.once("exit", (code, signal) => {
       const fire = () => {
         const current = this._daemons.get(sessionId);
         // Only treat as a crash if THIS process is still the registered
-        // daemon.  The proc identity check guards the ABA case: an old
-        // daemon's late exit event (delivered after reapDaemon() + a fresh
+        // session-proxy.  The proc identity check guards the ABA case: an old
+        // session-proxy's late exit event (delivered after reapSessionProxy() + a fresh
         // spawn under the same sessionId) must not reap the healthy
         // replacement entry.
         if (current !== undefined && !(current instanceof Promise) && current.proc === proc) {
@@ -356,31 +356,31 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
       };
       const current = this._daemons.get(sessionId);
       if (current instanceof Promise) {
-        // The exit raced ensureDaemon()'s `await spawnPromise` continuation:
+        // The exit raced ensureSessionProxy()'s `await spawnPromise` continuation:
         // the map still holds the in-flight promise this entry will be
-        // registered under.  Re-check after it settles (ensureDaemon's
+        // registered under.  Re-check after it settles (ensureSessionProxy's
         // continuation — registered first — replaces the promise with the
         // entry before our continuation runs).
         void current.then(
           () => queueMicrotask(fire),
-          () => { /* spawn failed; ensureDaemon already removed the entry */ },
+          () => { /* spawn failed; ensureSessionProxy already removed the entry */ },
         );
       } else {
         fire();
       }
     });
 
-    const entry: DaemonEntry = {
+    const entry: SessionProxyEntry = {
       sessionId,
-      socketPath: daemonSockPath,
+      socketPath: sessionProxySockPath,
       proc,
-      ready: Promise.resolve(daemonSockPath),
+      ready: Promise.resolve(sessionProxySockPath),
     };
 
     return entry;
   }
 
-  private _killEntry(entry: DaemonEntry): void {
+  private _killEntry(entry: SessionProxyEntry): void {
     try {
       entry.proc.kill("SIGTERM");
     } catch {
@@ -393,6 +393,6 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
 // Factory
 // ---------------------------------------------------------------------------
 
-export function createDaemonSupervisor(): DaemonSupervisor {
-  return new DaemonSupervisorImpl();
+export function createSessionProxySupervisor(): SessionProxySupervisor {
+  return new SessionProxySupervisorImpl();
 }

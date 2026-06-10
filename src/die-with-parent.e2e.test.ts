@@ -1,33 +1,33 @@
 /**
- * die-with-parent.e2e.test.ts — tc-2c5 acceptance: SIGKILL the broker, the
- * daemon dies with it; tmux survives; a fresh broker recovers.
+ * die-with-parent.e2e.test.ts — tc-2c5 acceptance: SIGKILL the serverProxy, the
+ * session-proxy dies with it; tmux survives; a fresh server-proxy recovers.
  *
- * # Why a subprocess broker
+ * # Why a subprocess server-proxy
  *
- * The other broker tests run createBroker() in-process and shut down
- * gracefully.  This suite spawns broker-entry as a REAL child process so it
+ * The other server-proxy tests run createServerProxy() in-process and shut down
+ * gracefully.  This suite spawns server-proxy-entry as a REAL child process so it
  * can be SIGKILLed — the one teardown path that delivers NO signal to the
- * broker's children and therefore exercises the daemon's own die-with-parent
- * watchdog (tc-2c5; getppid poll installed in daemon-entry.ts).  Without that
- * watchdog the daemon would be silently reparented to init and serve forever
+ * server-proxy's children and therefore exercises the session-proxy's own die-with-parent
+ * watchdog (tc-2c5; getppid poll installed in session-proxy-entry.ts).  Without that
+ * watchdog the session-proxy would be silently reparented to init and serve forever
  * (the 2026-06-08 orphan observation).
  *
  * # Scenarios
  *
- * D1. broker(subprocess) + session.claim → daemon + PTY bridge running.
- *     SIGKILL the broker:
- *       a. the daemon process exits ≤ 3 s (poll ≤ 1 s + graceful stop)
+ * D1. serverProxy(subprocess) + session.claim → session-proxy + PTY bridge running.
+ *     SIGKILL the serverProxy:
+ *       a. the session-proxy process exits ≤ 3 s (poll ≤ 1 s + graceful stop)
  *       b. the python PTY bridge exits with it (enforcement one level down)
  *       c. the tmux server + session SURVIVE — tmux is the persistence layer
- *     Then the recovery path (ext-a §6.3, broker README "Lifetime"):
- *       d. a fresh broker spawns, claims the SAME session against the
- *          surviving tmux state, and gets a FRESH daemon (new pid, no
+ *     Then the recovery path (ext-a §6.3, server-proxy README "Lifetime"):
+ *       d. a fresh server-proxy spawns, claims the SAME session against the
+ *          surviving tmux state, and gets a FRESH sessionProxy (new pid, no
  *          orphan-and-reclaim).
  *
  * # Cleanup
  *
  * Unique tmux socket name (tmuxcc-test-dwp-…) and a unique runtime dir per
- * run.  The finally block SIGKILLs both brokers and any surviving daemon /
+ * run.  The finally block SIGKILLs both brokers and any surviving session-proxy /
  * bridge pids, kills the tmux test server, and removes the runtime dir —
  * even on assertion failure.
  *
@@ -41,14 +41,14 @@ import { fileURLToPath } from "node:url";
 import { join, dirname } from "node:path";
 import * as fs from "node:fs";
 
-import { connectSocketTransport, brokerSocketPath } from "./index.js";
-import { runClientHandshake, WIRE_PROTOCOL_VERSION } from "@tmuxcc/daemon";
+import { connectSocketTransport, serverProxySocketPath } from "./index.js";
+import { runClientHandshake, WIRE_PROTOCOL_VERSION } from "@tmuxcc/session-proxy";
 import type {
   Transport,
-  BrokerCommandResponseMessage,
+  ServerProxyCommandResponseMessage,
   Capabilities,
   MessageBase,
-} from "@tmuxcc/daemon";
+} from "@tmuxcc/session-proxy";
 
 // ---------------------------------------------------------------------------
 // Paths + guards
@@ -56,7 +56,7 @@ import type {
 
 const __dir = dirname(fileURLToPath(import.meta.url));
 const PACKAGE_ROOT = join(__dir, "..");
-const BROKER_ENTRY = join(__dir, "broker-entry.ts");
+const SERVER_PROXY_ENTRY = join(__dir, "server-proxy-entry.ts");
 
 function tmuxAvailable(): boolean {
   const r = spawnSync("tmux", ["-V"], { stdio: "ignore", timeout: 2_000 });
@@ -160,7 +160,7 @@ function waitForLine(proc: ChildProcess, line: string, timeoutMs: number): Promi
 }
 
 // ---------------------------------------------------------------------------
-// Broker-wire helpers (minimal versions of the broker.test.ts harness)
+// ServerProxy-wire helpers (minimal versions of the server-proxy.test.ts harness)
 // ---------------------------------------------------------------------------
 
 const CLIENT_CAPS: Capabilities = {
@@ -168,14 +168,14 @@ const CLIENT_CAPS: Capabilities = {
   features: ["sessions-watch", "session-create", "session-destroy", "session-claim", "pane-attach"],
 };
 
-/** Spawn broker-entry as a real subprocess and wait for READY. */
-async function spawnBrokerProcess(socketName: string, runtimeDir: string): Promise<ChildProcess> {
+/** Spawn server-proxy-entry as a real subprocess and wait for READY. */
+async function spawnServerProxyProcess(socketName: string, runtimeDir: string): Promise<ChildProcess> {
   const proc = spawn(
     process.execPath,
     [
       "--import",
       "tsx",
-      BROKER_ENTRY,
+      SERVER_PROXY_ENTRY,
       "--socket-name",
       socketName,
       "--runtime-dir",
@@ -191,13 +191,13 @@ async function spawnBrokerProcess(socketName: string, runtimeDir: string): Promi
     await waitForLine(proc, "READY", 20_000);
   } catch (err) {
     killQuiet(proc.pid);
-    throw new Error(`broker-entry did not become READY: ${String(err)}; stderr: ${stderrBuf}`);
+    throw new Error(`server-proxy-entry did not become READY: ${String(err)}; stderr: ${stderrBuf}`);
   }
   return proc;
 }
 
 /**
- * Connect to a broker socket, run the handshake, claim `sessionName`, return
+ * Connect to a server-proxy socket, run the handshake, claim `sessionName`, return
  * the claim payload.  Closes the transport before returning.
  */
 async function claimSession(
@@ -206,10 +206,10 @@ async function claimSession(
 ): Promise<{ sessionId: string; endpoint: string }> {
   const transport: Transport = await connectSocketTransport(endpoint);
   try {
-    await runClientHandshake(transport, CLIENT_CAPS, "broker.capabilities");
+    await runClientHandshake(transport, CLIENT_CAPS, "server-proxy.capabilities");
 
     const correlationId = `corr-${Math.random().toString(36).slice(2)}`;
-    const responsePromise = new Promise<BrokerCommandResponseMessage>((resolve, reject) => {
+    const responsePromise = new Promise<ServerProxyCommandResponseMessage>((resolve, reject) => {
       const timer = setTimeout(
         () => reject(new Error("Timeout waiting for session.claim response")),
         20_000,
@@ -219,7 +219,7 @@ async function claimSession(
         const m = msg as unknown as MessageBase & { correlationId?: string };
         if (m.type === "command.response" && m.correlationId === correlationId) {
           clearTimeout(timer);
-          resolve(msg as unknown as BrokerCommandResponseMessage);
+          resolve(msg as unknown as ServerProxyCommandResponseMessage);
         }
       });
     });
@@ -252,7 +252,7 @@ describe(
   { skip: !TMUX_AVAILABLE ? "tmux not found on PATH" : false },
   () => {
     it(
-      "D1: SIGKILL broker → daemon + bridge die ≤ 3 s; tmux survives; fresh broker recovers",
+      "D1: SIGKILL server-proxy → session-proxy + bridge die ≤ 3 s; tmux survives; fresh server-proxy recovers",
       { timeout: 60_000 },
       async () => {
         const socketName = `tmuxcc-test-dwp-${process.pid}-${Date.now()}`;
@@ -261,59 +261,59 @@ describe(
 
         let broker1: ChildProcess | undefined;
         let broker2: ChildProcess | undefined;
-        let daemonPid: number | undefined;
+        let sessionProxyPid: number | undefined;
         let bridgePid: number | undefined;
         let daemon2Pid: number | undefined;
 
         try {
-          // ── Arrange: real broker subprocess + claimed session ─────────────
-          broker1 = await spawnBrokerProcess(socketName, runtimeDir);
-          const endpoint = brokerSocketPath(socketName, { runtimeDir });
+          // ── Arrange: real server-proxy subprocess + claimed session ─────────────
+          broker1 = await spawnServerProxyProcess(socketName, runtimeDir);
+          const endpoint = serverProxySocketPath(socketName, { runtimeDir });
           await claimSession(endpoint, sessionName);
 
-          // Locate the spawned daemon (direct child of the broker running
-          // daemon-entry) and its python PTY bridge (direct child of the
-          // daemon).  Both exist by the time session.claim resolves — the
-          // supervisor waits for the daemon's READY, which follows
-          // daemon.start() (bridge spawned).
-          const brokerPid = broker1.pid!;
-          daemonPid = await waitForPid(
-            () => findChildPid(brokerPid, "daemon-entry"),
+          // Locate the spawned sessionProxy (direct child of the server-proxy running
+          // session-proxy-entry) and its python PTY bridge (direct child of the
+          // sessionProxy).  Both exist by the time session.claim resolves — the
+          // supervisor waits for the session-proxy's READY, which follows
+          // sessionProxy.start() (bridge spawned).
+          const serverProxyPid = broker1.pid!;
+          sessionProxyPid = await waitForPid(
+            () => findChildPid(serverProxyPid, "session-proxy-entry"),
             5_000,
-            "daemon process (child of broker matching daemon-entry)",
+            "session-proxy process (child of server-proxy matching session-proxy-entry)",
           );
           bridgePid = await waitForPid(
-            () => findChildPid(daemonPid!, "tmux-pty-bridge"),
+            () => findChildPid(sessionProxyPid!, "tmux-pty-bridge"),
             5_000,
-            "PTY bridge (child of daemon matching tmux-pty-bridge)",
+            "PTY bridge (child of session-proxy matching tmux-pty-bridge)",
           );
 
-          assert.ok(alive(daemonPid), "sanity: daemon alive before broker kill");
-          assert.ok(alive(bridgePid), "sanity: bridge alive before broker kill");
+          assert.ok(alive(sessionProxyPid), "sanity: session-proxy alive before server-proxy kill");
+          assert.ok(alive(bridgePid), "sanity: bridge alive before server-proxy kill");
 
-          // ── Act: SIGKILL the broker — no signal reaches its children ──────
+          // ── Act: SIGKILL the server-proxy — no signal reaches its children ──────
           broker1.kill("SIGKILL");
 
-          // ── Assert (a): daemon exits ≤ 3 s — tc-2c5 acceptance budget.
+          // ── Assert (a): session-proxy exits ≤ 3 s — tc-2c5 acceptance budget.
           // getppid poll (1 s cadence) + self-SIGTERM + graceful stop; the
           // 1.5 s hard-exit backstop bounds a stalled stop.
-          const daemonGoneMs = await waitUntilGone(daemonPid, 10_000);
+          const sessionProxyGoneMs = await waitUntilGone(sessionProxyPid, 10_000);
           assert.ok(
-            daemonGoneMs <= 3_000,
-            `daemon must exit ≤ 3000 ms after broker SIGKILL; took ${daemonGoneMs} ms`,
+            sessionProxyGoneMs <= 3_000,
+            `session-proxy must exit ≤ 3000 ms after server-proxy SIGKILL; took ${sessionProxyGoneMs} ms`,
           );
 
-          // ── Assert (b): the PTY bridge dies with the daemon (it is reaped
-          // by the daemon's graceful stop; its own getppid watch + bounded
+          // ── Assert (b): the PTY bridge dies with the sessionProxy (it is reaped
+          // by the session-proxy's graceful stop; its own getppid watch + bounded
           // teardown backstop the hard-exit path).
           const bridgeGoneMs = await waitUntilGone(bridgePid, 3_000);
           assert.ok(
             bridgeGoneMs >= 0,
-            `bridge gone ${bridgeGoneMs} ms after daemon`, // waitUntilGone throws on timeout
+            `bridge gone ${bridgeGoneMs} ms after session-proxy`, // waitUntilGone throws on timeout
           );
 
           // ── Assert (c): tmux is the persistence layer — server + session
-          // must SURVIVE the broker+daemon death.
+          // must SURVIVE the server-proxy+session-proxy death.
           const has = spawnSync("tmux", ["-L", socketName, "has-session", "-t", sessionName], {
             stdio: "ignore",
             timeout: 5_000,
@@ -321,33 +321,33 @@ describe(
           assert.equal(
             has.status,
             0,
-            "tmux session must survive broker SIGKILL (tmux is the persistence layer)",
+            "tmux session must survive server-proxy SIGKILL (tmux is the persistence layer)",
           );
 
-          // ── Assert (d): recovery path — fresh broker, fresh daemon, same
-          // surviving session.  No orphan-and-reclaim: the new daemon is a
+          // ── Assert (d): recovery path — fresh serverProxy, fresh sessionProxy, same
+          // surviving session.  No orphan-and-reclaim: the new session-proxy is a
           // NEW process, not an adopted old one.
-          broker2 = await spawnBrokerProcess(socketName, runtimeDir);
+          broker2 = await spawnServerProxyProcess(socketName, runtimeDir);
           const payload2 = await claimSession(endpoint, sessionName);
-          assert.ok(payload2.endpoint, "recovery claim must return a daemon endpoint");
+          assert.ok(payload2.endpoint, "recovery claim must return a session-proxy endpoint");
 
           daemon2Pid = await waitForPid(
-            () => findChildPid(broker2!.pid!, "daemon-entry"),
+            () => findChildPid(broker2!.pid!, "session-proxy-entry"),
             5_000,
-            "fresh daemon process under the fresh broker",
+            "fresh session-proxy process under the fresh server-proxy",
           );
           assert.notEqual(
             daemon2Pid,
-            daemonPid,
-            "recovery must spawn a FRESH daemon process (no orphan-and-reclaim)",
+            sessionProxyPid,
+            "recovery must spawn a FRESH session-proxy process (no orphan-and-reclaim)",
           );
-          assert.ok(alive(daemon2Pid), "fresh daemon must be alive after recovery claim");
+          assert.ok(alive(daemon2Pid), "fresh session-proxy must be alive after recovery claim");
         } finally {
           // Kill everything we may have spawned, even on assertion failure.
           killQuiet(broker2?.pid);
           killQuiet(broker1?.pid);
           killQuiet(daemon2Pid);
-          killQuiet(daemonPid);
+          killQuiet(sessionProxyPid);
           killQuiet(bridgePid);
           // The tmux server intentionally survives the scenario — reap it.
           spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });

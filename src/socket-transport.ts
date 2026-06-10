@@ -24,7 +24,7 @@
  * exact boundary tracking is what lets data and control units interleave
  * arbitrarily across socket read chunks (tc-3y8.9; see _processBuffer).
  *
- * On the SEND side, `encodeFrame(paneId, seq, payload)` from @tmuxcc/daemon
+ * On the SEND side, `encodeFrame(paneId, seq, payload)` from @tmuxcc/session-proxy
  * produces the binary blob; we write it directly to the socket.
  *
  * # Control-plane framing (length-prefixed JSON)
@@ -48,9 +48,9 @@
  */
 
 import * as net from "node:net";
-import { FRAME_MAGIC, MAX_FRAME, decodeFrame, encodeFrame } from "@tmuxcc/daemon";
-import type { Transport, ControlHandler, DataHandler, CloseHandler } from "@tmuxcc/daemon";
-import type { PaneId } from "@tmuxcc/daemon";
+import { FRAME_MAGIC, MAX_FRAME, decodeFrame, encodeFrame } from "@tmuxcc/session-proxy";
+import type { Transport, ControlHandler, DataHandler, CloseHandler } from "@tmuxcc/session-proxy";
+import type { PaneId } from "@tmuxcc/session-proxy";
 
 // ---------------------------------------------------------------------------
 // Control-plane framing constants
@@ -60,7 +60,7 @@ import type { PaneId } from "@tmuxcc/daemon";
 const CTRL_LEN_SIZE = 4;
 
 // Per-pane sequence counter map (per transport instance).
-// In production the daemon owns sequence numbers; the broker socket transport
+// In production the session-proxy owns sequence numbers; the server-proxy socket transport
 // increments them per pane.
 const MAX_U32 = 0xffffffff;
 
@@ -86,9 +86,9 @@ class SocketTransport implements Transport {
   // sendControl callers receive the same promise so the upstream pipeline can
   // await it before producing more bytes.  This is the standard Node.js
   // Writable backpressure contract — see https://nodejs.org/api/stream.html
-  // "Buffering".  Without this, daemon-side flow-control credits bytes as
+  // "Buffering".  Without this, session-proxy-side flow-control credits bytes as
   // "drained" the instant they enter the kernel send buffer, so tmux is never
-  // told to pause and the daemon's outbound buffer grows without bound — the
+  // told to pause and the session-proxy's outbound buffer grows without bound — the
   // root cause of the `find /` wedge.
   private _drainPromise: Promise<void> | null = null;
   private _drainResolve: (() => void) | null = null;
@@ -249,7 +249,7 @@ class SocketTransport implements Transport {
         //       MB), so `_buf` waited forever for bytes that never come:
         //       inbound silently stalled while the socket stayed open.
         //       Outbound sends kept working — commands still reached tmux
-        //       while every daemon→client live delta vanished (the dead
+        //       while every session-proxy→client live delta vanished (the dead
         //       live-delta path of tc-3y8.9 / the load-dependent delta stalls
         //       of tc-3y8.4).
         //

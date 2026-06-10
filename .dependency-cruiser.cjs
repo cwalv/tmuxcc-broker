@@ -3,27 +3,27 @@
  *
  * Enforces the polyrepo boundary invariant:
  *
- *   broker-no-daemon-runtime: broker/src/ must not import @tmuxcc/daemon
- *   internal sub-paths (e.g. @tmuxcc/daemon/src/runtime/…). Only the
- *   package barrel (@tmuxcc/daemon) is allowed.
+ *   server-proxy-no-daemon-runtime: server-proxy/src/ must not import @tmuxcc/session-proxy
+ *   internal sub-paths (e.g. @tmuxcc/session-proxy/src/runtime/…). Only the
+ *   package barrel (@tmuxcc/session-proxy) is allowed.
  *
- * Rationale: @tmuxcc/daemon barrel is the stable contract seam.
+ * Rationale: @tmuxcc/session-proxy barrel is the stable contract seam.
  * Importing internal sub-paths bypasses the exports map and creates
- * invisible coupling to daemon internals.
+ * invisible coupling to session-proxy internals.
  */
 /** @type {import('dependency-cruiser').IConfiguration} */
 module.exports = {
   forbidden: [
     {
-      name: "broker-no-daemon-runtime",
+      name: "server-proxy-no-session-proxy-runtime",
       comment:
-        "broker/src/ must only import from the @tmuxcc/daemon barrel. " +
-        "Sub-path imports like @tmuxcc/daemon/src/runtime/… bypass the " +
-        "exports map and couple the broker to daemon internals.",
+        "server-proxy/src/ must only import from the @tmuxcc/session-proxy barrel. " +
+        "Sub-path imports like @tmuxcc/session-proxy/src/runtime/… bypass the " +
+        "exports map and couple the server-proxy to session-proxy internals.",
       severity: "error",
       from: { path: "^src/" },
       to: {
-        path: "@tmuxcc/daemon/src/",
+        path: "@tmuxcc/session-proxy/src/",
       },
     },
   ],

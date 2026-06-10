@@ -1,14 +1,14 @@
 /**
- * broker-log.test.ts — unit tests for the append-only broker log (tc-k6v).
+ * server-proxy-log.test.ts — unit tests for the append-only server-proxy log (tc-k6v).
  *
- * L1. openBrokerLog creates the file (0600) and append() writes
+ * L1. openServerProxyLog creates the file (0600) and append() writes
  *     timestamp-prefixed chunks.
  * L2. append() after close() is a silent no-op (best-effort contract).
- * L3. openBrokerLog returns null when the path is unwritable.
+ * L3. openServerProxyLog returns null when the path is unwritable.
  * L4. installStderrMirror tees stderr writes into the log and the uninstall
  *     function restores the original write.
  *
- * @module broker-log.test
+ * @module server-proxy-log.test
  */
 
 import { describe, it } from "node:test";
@@ -17,21 +17,21 @@ import * as fs from "node:fs";
 import * as os from "node:os";
 import * as path from "node:path";
 
-import { openBrokerLog, installStderrMirror } from "./broker-log.js";
+import { openServerProxyLog, installStderrMirror } from "./server-proxy-log.js";
 
 function tempLogPath(label: string): string {
   const dir = fs.mkdtempSync(path.join(os.tmpdir(), `tmuxcc-test-brokerlog-${label}-`));
-  return path.join(dir, "broker.log");
+  return path.join(dir, "server-proxy.log");
 }
 
 /** Matches an ISO-8601 timestamp prefix, e.g. "2026-06-10T12:34:56.789Z ". */
 const TS_PREFIX = /^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}\.\d{3}Z /;
 
-describe("broker-log (tc-k6v)", () => {
+describe("server-proxy-log (tc-k6v)", () => {
   it("L1: append() writes timestamp-prefixed chunks to the file", () => {
     const logPath = tempLogPath("l1");
-    const log = openBrokerLog(logPath);
-    assert.ok(log, "openBrokerLog must succeed on a writable dir");
+    const log = openServerProxyLog(logPath);
+    assert.ok(log, "openServerProxyLog must succeed on a writable dir");
 
     try {
       log.append("first line\n");
@@ -55,7 +55,7 @@ describe("broker-log (tc-k6v)", () => {
 
   it("L2: append() after close() is a silent no-op", () => {
     const logPath = tempLogPath("l2");
-    const log = openBrokerLog(logPath);
+    const log = openServerProxyLog(logPath);
     assert.ok(log);
 
     log.append("before close\n");
@@ -68,15 +68,15 @@ describe("broker-log (tc-k6v)", () => {
     assert.ok(!content.includes("after close"), "post-close append must not land");
   });
 
-  it("L3: openBrokerLog returns null when the path is unwritable", () => {
+  it("L3: openServerProxyLog returns null when the path is unwritable", () => {
     // A path whose parent does not exist cannot be opened.
-    const log = openBrokerLog("/nonexistent-dir-tmuxcc-test/broker.log");
+    const log = openServerProxyLog("/nonexistent-dir-tmuxcc-test/server-proxy.log");
     assert.equal(log, null);
   });
 
   it("L4: installStderrMirror tees stderr writes; uninstall restores", () => {
     const logPath = tempLogPath("l4");
-    const log = openBrokerLog(logPath);
+    const log = openServerProxyLog(logPath);
     assert.ok(log);
 
     const origWrite = process.stderr.write;

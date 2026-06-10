@@ -1,14 +1,14 @@
 /**
- * tmux south-side — broker's thin connection to the tmux server.
+ * tmux south-side — server-proxy's thin connection to the tmux server.
  *
  * # Design
  *
- * The broker holds ONE thin `tmux -L <socketName> -CC attach` connection
+ * The server-proxy holds ONE thin `tmux -L <socketName> -CC attach` connection
  * purely to receive `%sessions-changed` notifications. Per SCHEMA.md:
  *   "Hold one thin `tmux -L <socketName> -CC attach` connection purely to
  *    receive `%sessions-changed` notifications. Do NOT process pane events."
  *
- * For state reads the broker shells out to `tmux list-sessions` etc.
+ * For state reads the server-proxy shells out to `tmux list-sessions` etc.
  *
  * # Watcher lifecycle (tc-3iv, ext-a-design-context.md §6.2)
  *
@@ -22,7 +22,7 @@
  *   2. Attached: invoke `onChanged` for each `%sessions-changed` line.
  *   3. EOF: when the attached `-CC` process exits for ANY reason, invoke
  *      `onEof` exactly once and go inert.  The watcher does NOT reconnect
- *      on its own — the owner (the broker) disambiguates via
+ *      on its own — the owner (the serverProxy) disambiguates via
  *      `probeTmuxAlive` and either re-spawns a fresh watcher (watcher died,
  *      tmux alive) or self-exits (tmux genuinely gone).
  *
@@ -35,7 +35,7 @@
  * stdin on a plain pipe (or /dev/null) it exits immediately with "tcgetattr
  * failed: Inappropriate ioctl for device".  A direct `child_process.spawn`
  * watcher therefore dies instantly and silently degrades into a poller.
- * The watcher reuses the daemon's `createTmuxHost` (python PTY bridge) so the
+ * The watcher reuses the session-proxy's `createTmuxHost` (python PTY bridge) so the
  * `-CC` connection is genuinely live — required for EOF to be a meaningful
  * tmux-death signal.  It attaches with client flags `no-output,ignore-size`:
  * the thin watcher must not receive pane output (§6.2 "do NOT process pane
@@ -45,8 +45,8 @@
  */
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
-import { createTmuxHost } from "@tmuxcc/daemon";
-import type { TmuxHost } from "@tmuxcc/daemon";
+import { createTmuxHost } from "@tmuxcc/session-proxy";
+import type { TmuxHost } from "@tmuxcc/session-proxy";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -119,7 +119,7 @@ export function listSessions(socketName: string): TmuxSessionRow[] {
 
 /**
  * PID of the tmux server on `socketName`, or `null` when the server is not
- * running (tc-k6v `broker.info`).
+ * running (tc-k6v `server-proxy.info`).
  *
  * Uses `list-sessions -F '#{pid}'` rather than `display-message -p`: the
  * format variable `#{pid}` is the server pid in any format context, and
@@ -140,7 +140,7 @@ export function getTmuxServerPid(socketName: string): number | null {
 }
 
 /**
- * Pane counts per session (tc-k6v `broker.info`): maps tmux session id
+ * Pane counts per session (tc-k6v `server-proxy.info`): maps tmux session id
  * (e.g. `"$1"`) → number of panes across all of the session's windows.
  *
  * Runs `tmux -L <socketName> list-panes -a -F '#{session_id}'` and tallies
@@ -166,17 +166,17 @@ export function countPanesBySession(socketName: string): Map<string, number> {
  *
  * tmuxcc attaches its own control-mode clients to every claimed session:
  *
- *   - **Daemon** (`-CC attach -t <session>`): flags include `control-mode`
+ *   - **SessionProxy** (`-CC attach -t <session>`): flags include `control-mode`
  *     but NOT `no-output` or `ignore-size`.  One per claimed session.
  *   - **Watcher** (`-CC attach -f no-output,ignore-size`): flags include
- *     `control-mode`, `no-output`, AND `ignore-size`.  One per broker.
+ *     `control-mode`, `no-output`, AND `ignore-size`.  One per server-proxy.
  *
  * Both are distinguishable from real human clients by the presence of
  * `control-mode` in their `client_flags` — a tmux control-mode connection
  * is never opened by a regular terminal user.
  *
  * Empirical evidence (tmux 3.4, tmuxcc test socket):
- *   daemon client: `attached,focused,control-mode,UTF-8`
+ *   session-proxy client: `attached,focused,control-mode,UTF-8`
  *   watcher client: `attached,focused,control-mode,ignore-size,no-output,UTF-8`
  *
  * Returns a map of tmux session id (e.g. `"$1"`) → count of tmuxcc-owned
@@ -197,7 +197,7 @@ export function countTmuxccClientsBySession(socketName: string): Map<string, num
     if (spaceIdx < 0) continue;
     const flags = line.slice(0, spaceIdx);
     const sessionId = line.slice(spaceIdx + 1);
-    // `control-mode` is present on ALL tmuxcc-owned clients (daemon + watcher).
+    // `control-mode` is present on ALL tmuxcc-owned clients (session-proxy + watcher).
     // Regular terminal users never open a control-mode connection.
     if (flags.includes("control-mode")) {
       counts.set(sessionId, (counts.get(sessionId) ?? 0) + 1);
@@ -214,7 +214,7 @@ export function countTmuxccClientsBySession(socketName: string): Map<string, num
  * `@tmuxcc 1` on the session (tc-w61) so that `listTmuxccSessions` can
  * surface it.  The `set-option` failure is intentionally non-fatal — if the
  * marker cannot be set (extremely unusual), the session still exists and the
- * daemon will start; the session just won't appear in the attach-picker until
+ * session-proxy will start; the session just won't appear in the attach-picker until
  * the marker is applied on the next claim.
  */
 export function createSession(socketName: string, name: string): void {
@@ -268,8 +268,8 @@ export function setSessionMarker(socketName: string, name: string): void {
  *
  * Throws if the command fails (tmux server unavailable or invalid window target).
  *
- * tc-7xv.12: broker-side surface for `setSynchronizePanes`.  Routes through
- * a connected daemon's `set-synchronize-panes` WireCommand when a daemon
+ * tc-7xv.12: server-proxy-side surface for `setSynchronizePanes`.  Routes through
+ * a connected session-proxy's `set-synchronize-panes` WireCommand when a session-proxy
  * is available; falls back to this direct-tmux path otherwise.
  */
 export function setWindowSynchronizePanes(
@@ -299,7 +299,7 @@ export function setWindowSynchronizePanes(
  *
  * Throws if the command fails (tmux server unavailable or invalid window target).
  *
- * tc-7xv.15: broker-side surface for `setMonitorActivity`.
+ * tc-7xv.15: server-proxy-side surface for `setMonitorActivity`.
  */
 export function setWindowMonitorActivity(
   socketName: string,
@@ -328,7 +328,7 @@ export function setWindowMonitorActivity(
  *
  * Throws if the command fails (tmux server unavailable or invalid window target).
  *
- * tc-7xv.15: broker-side surface for `setMonitorSilence`.
+ * tc-7xv.15: server-proxy-side surface for `setMonitorSilence`.
  */
 export function setWindowMonitorSilence(
   socketName: string,
@@ -378,7 +378,7 @@ export function killSession(socketName: string, id: string): void {
  * Any other outcome — non-zero exit ("no server running on …"), spawn
  * failure, or timeout — resolves `false`.
  *
- * Async (unlike the other helpers in this module) so the broker stays
+ * Async (unlike the other helpers in this module) so the server-proxy stays
  * responsive to connected clients during the probe window.
  */
 export function probeTmuxAlive(socketName: string, timeoutMs: number): Promise<boolean> {
@@ -476,7 +476,7 @@ export function createTmuxWatcher(
     //                 session-lifecycle notifications (§6.2)
     //   ignore-size — a thin 220x50 watcher must not drive session resizing
     //                 for daemons / real clients attached to the same session
-    // Note: no `-d` — detaching other clients would disrupt daemon attaches.
+    // Note: no `-d` — detaching other clients would disrupt session-proxy attaches.
     const host = createTmuxHost({
       socketName,
       sessionName: target,
@@ -524,7 +524,7 @@ export function createTmuxWatcher(
     if (stopped || done) return;
     pollTimer = setTimeout(() => {
       pollTimer = null;
-      // Notify on each poll tick so the broker does a full refresh
+      // Notify on each poll tick so the server-proxy does a full refresh
       onChanged();
       connect();
       pollMs = Math.min(pollMs * POLL_FACTOR, POLL_MAX_MS);

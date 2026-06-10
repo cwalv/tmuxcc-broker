@@ -132,12 +132,12 @@ describe("socket-transport", () => {
   //
   // The wedge bug: SocketTransport.sendData and sendControl ignored the return
   // value from socket.write().  When the kernel send buffer filled (slow
-  // consumer), Node.js queues bytes in user-space without bound and the daemon
+  // consumer), Node.js queues bytes in user-space without bound and the session-proxy
   // never saw backpressure — so its flow controller credited bytes as drained
   // the instant they entered the send queue and never triggered tmux pause.
   //
   // The fix: when socket.write returns false, sendData/sendControl return a
-  // Promise<void> that resolves on the next 'drain' event.  The daemon's
+  // Promise<void> that resolves on the next 'drain' event.  The session-proxy's
   // addClient wrapper now chains noteDrained off that Promise so the flow
   // controller's bufferedBytes counter reflects actual consumer consumption.
   //

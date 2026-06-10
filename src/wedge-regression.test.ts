@@ -4,24 +4,24 @@
  * # What this verifies
  *
  * The wedge bug (tc-7xv.24): under sustained high-throughput pane output
- * (e.g. `find /` in a tmuxcc terminal) the pty wedged because the broker's
+ * (e.g. `find /` in a tmuxcc terminal) the pty wedged because the server-proxy's
  * `SocketTransport.sendData` ignored Node's backpressure return value.  When
  * the consumer was slow:
  *
- *   1. tmux fired %output bytes into the daemon pipeline.
+ *   1. tmux fired %output bytes into the session-proxy pipeline.
  *   2. demux.store.append called transport.sendData.
  *   3. socket.write returned false (kernel send buffer full).
  *   4. SocketTransport ignored the return value (fire-and-forget).
- *   5. daemon.addClient wrapper called fc.noteDrained immediately, crediting
+ *   5. sessionProxy.addClient wrapper called fc.noteDrained immediately, crediting
  *      the bytes as drained the instant they entered the kernel send buffer.
  *   6. fc.bufferedBytes never grew → high-water never crossed → tmux never
- *      paused → daemon's outbound buffer grew without bound until V8 stalled.
+ *      paused → session-proxy's outbound buffer grew without bound until V8 stalled.
  *
  * The fix (tc-7xv.6):
  *
  *   - SocketTransport.sendData returns Promise<void> when socket.write returns
  *     false.  The promise resolves on the socket's 'drain' event.
- *   - daemon.addClient's wrapper chains fc.noteDrained off that promise so the
+ *   - sessionProxy.addClient's wrapper chains fc.noteDrained off that promise so the
  *     drain credit fires only after actual consumer consumption.
  *   - Now fc.bufferedBytes accurately reflects in-flight bytes; under a slow
  *     consumer it crosses high-water and tmux is correctly told to pause.
@@ -50,20 +50,20 @@ import * as os from "node:os";
 import * as path from "node:path";
 import * as fs from "node:fs";
 
-// Pull the daemon-side flow-control and demux primitives from @tmuxcc/daemon
-// (broker depends on daemon).  The SocketTransport lives in this same package,
+// Pull the session-proxy-side flow-control and demux primitives from @tmuxcc/session-proxy
+// (server-proxy depends on sessionProxy).  The SocketTransport lives in this same package,
 // so we import it directly via the relative path.
 import {
   createOutputDemux,
   createFlowController,
   DEFAULT_HIGH_WATER_BYTES,
   paneId as mintPaneId,
-} from "@tmuxcc/daemon";
+} from "@tmuxcc/session-proxy";
 import type {
   PaneId,
   TmuxHost,
   Transport,
-} from "@tmuxcc/daemon";
+} from "@tmuxcc/session-proxy";
 
 import { connectSocketTransport } from "./socket-transport.js";
 
@@ -103,7 +103,7 @@ function makeFakeHost(): { write(data: string): void; writes: string[] } & TmuxH
 }
 
 /**
- * Build a "draining transport" identical in shape to the one daemon.ts wraps
+ * Build a "draining transport" identical in shape to the one session-proxy.ts wraps
  * around every attached transport — calls fc.noteDrained after sendData (sync
  * or after promise resolution per the tc-7xv.6 fix).
  */
@@ -152,7 +152,7 @@ describe("tc-7xv.24 wedge regression — real-socket backpressure engages tmux p
     const clientTransport = await connectSocketTransport(sockPath);
     after(() => clientTransport.close());
 
-    // Daemon-side wiring (mirrors daemon.ts createDaemon).
+    // SessionProxy-side wiring (mirrors session-proxy.ts createSessionProxy).
     const host = makeFakeHost();
     const demux = createOutputDemux();
     const fc = createFlowController(host, demux);
@@ -170,7 +170,7 @@ describe("tc-7xv.24 wedge regression — real-socket backpressure engages tmux p
       clear: baseStore.clear.bind(baseStore),
     };
 
-    // Attach the draining transport (same wrapper daemon.ts addClient builds).
+    // Attach the draining transport (same wrapper session-proxy.ts addClient builds).
     const drainingTransport = buildDrainingTransport(clientTransport, fc);
     demux.attachTransport(drainingTransport);
 

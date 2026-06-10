@@ -1,13 +1,13 @@
 /**
- * Runtime directory helpers — path resolution for broker and daemon sockets.
+ * Runtime directory helpers — path resolution for server-proxy and session-proxy sockets.
  *
  * Follows SCHEMA.md "Trust and security model":
  *   - Sockets live under $XDG_RUNTIME_DIR/tmuxcc/<socketName>/ (or
  *     /tmp/tmuxcc-<uid>/<socketName>/ as fallback) with directory mode 0700
  *     and socket mode 0600.
  *   - The sub-directory name is the tmux socket name (e.g. "tmuxcc"), making
- *     the broker socket path well-known and discoverable by clients:
- *     `<runtimeDir>/<socketName>/broker.sock`.
+ *     the server-proxy socket path well-known and discoverable by clients:
+ *     `<runtimeDir>/<socketName>/server-proxy.sock`.
  *
  * @module runtime-dir
  */
@@ -44,49 +44,49 @@ export function resolveBaseRuntimeDir(opts: RuntimeDirOptions = {}): string {
 }
 
 /**
- * Resolve the broker socket path: `<runtimeDir>/<socketName>/broker.sock`.
+ * Resolve the server-proxy socket path: `<runtimeDir>/<socketName>/server-proxy.sock`.
  * Creates the socket-name sub-directory at mode 0700.
  *
  * The `socketName` is the tmux socket name (e.g. `"tmuxcc"`).  Using the
  * socket name as the directory means the path is well-known and clients can
  * discover it without out-of-band communication.
  */
-export function brokerSocketPath(
+export function serverProxySocketPath(
   socketName: string,
   opts: RuntimeDirOptions = {},
 ): string {
   const base = resolveBaseRuntimeDir(opts);
   const dir = path.join(base, socketName);
   ensureDir(dir, 0o700);
-  return path.join(dir, "broker.sock");
+  return path.join(dir, "server-proxy.sock");
 }
 
 /**
- * Resolve the broker log file path: `<runtimeDir>/<socketName>/broker.log`
+ * Resolve the server-proxy log file path: `<runtimeDir>/<socketName>/server-proxy.log`
  * (tc-k6v).  Creates the socket-name sub-directory at mode 0700 (same as
- * `brokerSocketPath`) but does NOT create the file — the broker entry point
- * opens it append-only; readers (the VS Code `tmuxcc.showBrokerLogs` tail)
+ * `serverProxySocketPath`) but does NOT create the file — the server-proxy entry point
+ * opens it append-only; readers (the VS Code `tmuxcc.showServerProxyLogs` tail)
  * tolerate a missing file.
  *
- * Like the broker socket, the path is well-known and derivable by clients
+ * Like the server-proxy socket, the path is well-known and derivable by clients
  * without out-of-band communication.
  */
-export function brokerLogPath(
+export function serverProxyLogPath(
   socketName: string,
   opts: RuntimeDirOptions = {},
 ): string {
   const base = resolveBaseRuntimeDir(opts);
   const dir = path.join(base, socketName);
   ensureDir(dir, 0o700);
-  return path.join(dir, "broker.log");
+  return path.join(dir, "server-proxy.log");
 }
 
 /**
- * Resolve a daemon socket path:
+ * Resolve a session-proxy socket path:
  * `<runtimeDir>/<socketName>/<sessionId>.sock`.
  * Re-uses the already-created socket-name sub-directory.
  */
-export function daemonSocketPath(
+export function sessionProxySocketPath(
   socketName: string,
   sessionId: string,
   opts: RuntimeDirOptions = {},

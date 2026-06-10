@@ -1,9 +1,9 @@
 /**
- * Broker entry point — spawned as a child process by the VS Code extension
- * (or any other launcher) to start a broker for a given tmux socket name.
+ * ServerProxy entry point — spawned as a child process by the VS Code extension
+ * (or any other launcher) to start a server-proxy for a given tmux socket name.
  *
  * Arguments:
- *   --socket-name <name>    tmux socket name (= broker socket directory name)
+ *   --socket-name <name>    tmux socket name (= server-proxy socket directory name)
  *
  * Optional arguments:
  *   --runtime-dir <path>    override the base runtime directory
@@ -12,27 +12,27 @@
  *
  * Protocol:
  *   1. Parse arguments.
- *   2. Mirror stderr into the append-only broker log file at
- *      `<runtime>/<socketName>/broker.log` (tc-k6v) — launchers destroy the
- *      stderr pipe post-READY, so without the log the broker's diagnostics
- *      (daemon crashes, self-exit reasons) would vanish.
- *   3. Create and start a broker (createBroker from ./broker.js).
+ *   2. Mirror stderr into the append-only server-proxy log file at
+ *      `<runtime>/<socketName>/server-proxy.log` (tc-k6v) — launchers destroy the
+ *      stderr pipe post-READY, so without the log the server-proxy's diagnostics
+ *      (session-proxy crashes, self-exit reasons) would vanish.
+ *   3. Create and start a serverProxy (createServerProxy from ./server-proxy.js).
  *   4. Write "READY\n" to stdout so the launcher knows we are listening.
- *   5. On SIGTERM: call broker.shutdown() and exit cleanly.
- *   6. On broker self-exit (tc-3iv, §6.2 — tmux gone, or idle past the
- *      hysteresis window): exit 0.  The broker has already unlinked its
+ *   5. On SIGTERM: call serverProxy.shutdown() and exit cleanly.
+ *   6. On server-proxy self-exit (tc-3iv, §6.2 — tmux gone, or idle past the
+ *      hysteresis window): exit 0.  The server-proxy has already unlinked its
  *      socket file by the time the self-exit callback fires.
  *
- * This mirrors the daemon-entry.ts pattern: a thin entry script whose
+ * This mirrors the session-proxy-entry.ts pattern: a thin entry script whose
  * only job is argument parsing → start → READY signal → exit handling.
  *
- * @module broker-entry
+ * @module server-proxy-entry
  */
 
-import { createBroker } from "./broker.js";
-import type { BrokerOptions } from "./broker.js";
-import { brokerLogPath } from "./runtime-dir.js";
-import { openBrokerLog, installStderrMirror } from "./broker-log.js";
+import { createServerProxy } from "./server-proxy.js";
+import type { ServerProxyOptions } from "./server-proxy.js";
+import { serverProxyLogPath } from "./runtime-dir.js";
+import { openServerProxyLog, installStderrMirror } from "./server-proxy-log.js";
 
 // ---------------------------------------------------------------------------
 // Argument parsing
@@ -62,7 +62,7 @@ function parseArgs(): { socketName: string; runtimeDir?: string; idleExitMs?: nu
 
   if (!socketName) {
     process.stderr.write(
-      "Usage: broker-entry --socket-name <name> [--runtime-dir <path>] [--idle-exit-ms <n>]\n",
+      "Usage: server-proxy-entry --socket-name <name> [--runtime-dir <path>] [--idle-exit-ms <n>]\n",
     );
     process.exit(1);
   }
@@ -81,43 +81,43 @@ function parseArgs(): { socketName: string; runtimeDir?: string; idleExitMs?: nu
 async function main(): Promise<void> {
   const { socketName, runtimeDir, idleExitMs } = parseArgs();
 
-  // tc-k6v: mirror stderr into the append-only broker log file.  Best-effort:
-  // a failed open (unwritable runtime dir) leaves the broker running without
-  // a log — `broker.info` then reports `logPath: null`.
-  const log = openBrokerLog(
-    brokerLogPath(socketName, runtimeDir !== undefined ? { runtimeDir } : {}),
+  // tc-k6v: mirror stderr into the append-only server-proxy log file.  Best-effort:
+  // a failed open (unwritable runtime dir) leaves the server-proxy running without
+  // a log — `server-proxy.info` then reports `logPath: null`.
+  const log = openServerProxyLog(
+    serverProxyLogPath(socketName, runtimeDir !== undefined ? { runtimeDir } : {}),
   );
   if (log !== null) {
     installStderrMirror(log);
-    process.stderr.write(`broker: starting pid=${process.pid} socket=${socketName} log=${log.path}\n`);
+    process.stderr.write(`serverProxy: starting pid=${process.pid} socket=${socketName} log=${log.path}\n`);
   }
 
-  const brokerOpts: BrokerOptions = {
+  const serverProxyOpts: ServerProxyOptions = {
     socketName,
     ...(runtimeDir !== undefined ? { runtimeDir } : {}),
     ...(idleExitMs !== undefined ? { idleExitMs } : {}),
     ...(log !== null ? { logPath: log.path } : {}),
   };
-  const broker = createBroker(brokerOpts);
+  const serverProxy = createServerProxy(serverProxyOpts);
 
-  // tc-3iv (§6.2): the broker self-manages exit — immediately when tmux is
+  // tc-3iv (§6.2): the server-proxy self-manages exit — immediately when tmux is
   // confirmed gone, after the idle hysteresis at zero IPC clients.  By the
-  // time this callback fires, shutdown() has completed and the broker socket
+  // time this callback fires, shutdown() has completed and the server-proxy socket
   // file is unlinked, so a clean exit(0) is all that's left.
-  broker.onSelfExit((reason) => {
-    process.stderr.write(`broker self-exit: ${reason}\n`);
+  serverProxy.onSelfExit((reason) => {
+    process.stderr.write(`server-proxy self-exit: ${reason}\n`);
     process.exit(0);
   });
 
-  await broker.start();
+  await serverProxy.start();
 
   // Signal readiness to the launcher
   process.stdout.write("READY\n");
 
   // Handle SIGTERM gracefully
   process.once("SIGTERM", () => {
-    process.stderr.write("broker: SIGTERM received, shutting down\n");
-    void broker.shutdown().finally(() => {
+    process.stderr.write("serverProxy: SIGTERM received, shutting down\n");
+    void serverProxy.shutdown().finally(() => {
       process.exit(0);
     });
   });
@@ -125,6 +125,6 @@ async function main(): Promise<void> {
 
 // Run
 main().catch((err: unknown) => {
-  process.stderr.write(`broker-entry fatal: ${String(err)}\n`);
+  process.stderr.write(`server-proxy-entry fatal: ${String(err)}\n`);
   process.exit(1);
 });

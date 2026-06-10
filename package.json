@@ -1,5 +1,5 @@
 {
-  "name": "@tmuxcc/broker",
+  "name": "@tmuxcc/server-proxy",
   "version": "0.0.0",
   "private": true,
   "type": "module",
@@ -24,7 +24,7 @@
     "format": "prettier --write src"
   },
   "dependencies": {
-    "@tmuxcc/daemon": "*"
+    "@tmuxcc/session-proxy": "*"
   },
   "devDependencies": {
     "@types/node": "^22.19.19",

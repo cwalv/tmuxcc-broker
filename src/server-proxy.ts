@@ -1,44 +1,44 @@
 /**
- * Broker — the per-socket discovery and lifecycle service (SCHEMA.md Stage 2).
+ * ServerProxy — the per-socket discovery and lifecycle service (SCHEMA.md Stage 2).
  *
  * # Public API
  *
  * ```ts
- * const broker = createBroker({ socketName: "tmuxcc" });
- * await broker.start();
- * // broker is now accepting connections at broker.endpoint()
- * await broker.shutdown();
+ * const serverProxy = createServerProxy({ socketName: "tmuxcc" });
+ * await serverProxy.start();
+ * // server-proxy is now accepting connections at serverProxy.endpoint()
+ * await serverProxy.shutdown();
  * ```
  *
  * # Architecture
  *
- * The broker owns:
- *   1. A unix socket server at `endpoint()` for incoming broker-wire connections
+ * The server-proxy owns:
+ *   1. A unix socket server at `endpoint()` for incoming server-proxy-wire connections
  *   2. A thin tmux -CC watcher (south side) for %sessions-changed notifications
  *   3. A session table mapping session names → { sessionId, tmuxId, ... }
- *   4. A daemon supervisor that spawns/reaps per-session daemon child processes
+ *   4. A session-proxy supervisor that spawns/reaps per-session session-proxy child processes
  *   5. A set of connected client transports (fan-out for delta messages)
  *   6. Its own exit policy (tc-3iv, ext-a-design-context.md §6.2): immediate
  *      self-exit when tmux is confirmed gone (watcher EOF + failed `tmux ls`
  *      probe), and a 5-minute hysteresis self-exit at zero IPC clients.  Both
- *      paths unlink the broker socket file before reporting exit.
+ *      paths unlink the server-proxy socket file before reporting exit.
  *
- * # Wire protocol (Broker wire)
+ * # Wire protocol (ServerProxy wire)
  *
  * Each incoming connection:
- *   1. runServerHandshake with "broker.capabilities"
- *   2. Send BrokerSnapshotMessage (seq=2)
- *   3. Accept BrokerCommandRequestMessages and send BrokerCommandResponseMessages
+ *   1. runServerHandshake with "server-proxy.capabilities"
+ *   2. Send ServerProxySnapshotMessage (seq=2)
+ *   3. Accept ServerProxyCommandRequestMessages and send ServerProxyCommandResponseMessages
  *   4. Fan-out session deltas when south-side state changes
  *
  * # Session ID stability
  *
- * Session IDs are broker-assigned, stable for the lifetime of the broker.
+ * Session IDs are server-proxy-assigned, stable for the lifetime of the server-proxy.
  * A new session ID is minted when a session first appears (from list-sessions
  * or from a session.create command). The same ID is reused for the session's
- * daemon and all delta messages.
+ * session-proxy and all delta messages.
  *
- * @module broker
+ * @module server-proxy
  */
 
 import * as path from "node:path";
@@ -46,40 +46,40 @@ import {
   runServerHandshake,
   WIRE_PROTOCOL_VERSION,
   sessionId as mintSessionId,
-} from "@tmuxcc/daemon";
+} from "@tmuxcc/session-proxy";
 import type {
   Transport,
   Capabilities,
-  BrokerCapabilitiesMessage,
-  BrokerSnapshotMessage,
-  BrokerSessionInfo,
-  BrokerSessionAddedMessage,
-  BrokerSessionRemovedMessage,
-  BrokerSessionRenamedMessage,
-  BrokerCommandRequestMessage,
-  BrokerCommandResponseMessage,
-  BrokerInfoPayload,
-  BrokerInfoSession,
+  ServerProxyCapabilitiesMessage,
+  ServerProxySnapshotMessage,
+  ServerProxySessionInfo,
+  ServerProxySessionAddedMessage,
+  ServerProxySessionRemovedMessage,
+  ServerProxySessionRenamedMessage,
+  ServerProxyCommandRequestMessage,
+  ServerProxyCommandResponseMessage,
+  ServerProxyInfoPayload,
+  ServerProxyInfoSession,
   ErrorMessage,
   MessageBase,
   PaneId,
   SessionId,
-} from "@tmuxcc/daemon";
+} from "@tmuxcc/session-proxy";
 
 import { createSocketServer, createSocketTransport } from "./socket-transport.js";
-import { brokerSocketPath, daemonSocketPath, removeSocket, restrictSocket } from "./runtime-dir.js";
+import { serverProxySocketPath, sessionProxySocketPath, removeSocket, restrictSocket } from "./runtime-dir.js";
 import { listSessions, createSession, killSession, createTmuxWatcher, probeTmuxAlive, setWindowSynchronizePanes, setWindowMonitorActivity, setWindowMonitorSilence, setSessionMarker, getTmuxServerPid, countPanesBySession, countTmuxccClientsBySession } from "./tmux-south.js";
 import type { TmuxWatcher } from "./tmux-south.js";
-import { createDaemonSupervisor } from "./daemon-supervisor.js";
-import type { DaemonSupervisor, DaemonExitInfo } from "./daemon-supervisor.js";
+import { createSessionProxySupervisor } from "./session-proxy-supervisor.js";
+import type { SessionProxySupervisor, SessionProxyExitInfo } from "./session-proxy-supervisor.js";
 import type { RuntimeDirOptions } from "./runtime-dir.js";
 
 // ---------------------------------------------------------------------------
 // Public types
 // ---------------------------------------------------------------------------
 
-/** Options for createBroker. */
-export interface BrokerOptions {
+/** Options for createServerProxy. */
+export interface ServerProxyOptions {
   /**
    * tmux socket name (passed as `-L <socketName>`).
    * Required — no default to prevent accidental attachment to user's tmux.
@@ -87,13 +87,13 @@ export interface BrokerOptions {
   socketName: string;
 
   /**
-   * Override the runtime directory for broker + daemon sockets.
+   * Override the runtime directory for server-proxy + session-proxy sockets.
    * Default: $XDG_RUNTIME_DIR/tmuxcc or /tmp/tmuxcc-<uid>.
    */
   runtimeDir?: string;
 
   /**
-   * Idle self-exit hysteresis (tc-3iv, §6.2): when the broker has had zero
+   * Idle self-exit hysteresis (tc-3iv, §6.2): when the server-proxy has had zero
    * IPC clients for this long, it self-exits.  Default 5 minutes — sized for
    * human-scale close+reopen workflows (reload-window gaps are sub-second).
    * Tests inject a short value instead of literally waiting 5 minutes.
@@ -101,57 +101,57 @@ export interface BrokerOptions {
   idleExitMs?: number;
 
   /**
-   * Absolute path of this broker process's log file, when the entry point
+   * Absolute path of this server-proxy process's log file, when the entry point
    * has installed stderr→file mirroring (tc-k6v).  Reported verbatim in
-   * `broker.info` responses so debug clients can locate the log without
+   * `server-proxy.info` responses so debug clients can locate the log without
    * out-of-band knowledge.  Omit for in-process/programmatic brokers
-   * (`broker.info` then reports `logPath: null`).
+   * (`server-proxy.info` then reports `logPath: null`).
    */
   logPath?: string;
 }
 
 /**
- * Why the broker self-exited (tc-3iv, §6.2):
+ * Why the server-proxy self-exited (tc-3iv, §6.2):
  *   - "tmux-gone": the thin `-CC` watcher EOFed AND the `tmux ls` probe
  *     confirmed the tmux server is gone.
  *   - "idle": zero IPC clients for the full hysteresis window.
  */
-export type BrokerSelfExitReason = "tmux-gone" | "idle";
+export type ServerProxySelfExitReason = "tmux-gone" | "idle";
 
-/** The broker handle returned by createBroker. */
-export interface BrokerHandle {
+/** The server-proxy handle returned by createServerProxy. */
+export interface ServerProxyHandle {
   /**
-   * Start the broker: create the unix socket, begin accepting connections,
+   * Start the serverProxy: create the unix socket, begin accepting connections,
    * and start the tmux watcher.
    */
   start(): Promise<void>;
 
   /**
    * Gracefully shut down: stop accepting connections, disconnect all clients,
-   * reap all daemons, and remove the broker socket file.
+   * reap all daemons, and remove the server-proxy socket file.
    */
   shutdown(): Promise<void>;
 
   /**
-   * The broker's unix socket path. Only valid after start() resolves.
+   * The server-proxy's unix socket path. Only valid after start() resolves.
    */
   endpoint(): string;
 
   // ── tc-3iv self-exit lifecycle (§6.2) ──────────────────────────────────────
 
   /**
-   * Number of currently open IPC connections to the broker socket.
+   * Number of currently open IPC connections to the server-proxy socket.
    *
    * "Client" means any open Unix-domain socket connection — counted at the
    * raw socket level, before (and regardless of) the wire handshake.  It does
    * NOT mean "has bound a terminal" or "has claimed a session"; a
-   * connected-but-idle client keeps the broker alive.
+   * connected-but-idle client keeps the server-proxy alive.
    */
   readonly connectedClientCount: number;
 
   /**
-   * Register a callback invoked after the broker has self-exited: shutdown is
-   * complete and the broker socket file is already unlinked when the callback
+   * Register a callback invoked after the server-proxy has self-exited: shutdown is
+   * complete and the server-proxy socket file is already unlinked when the callback
    * runs.  The entry point wires this to `process.exit(0)`.
    *
    * Self-exit triggers (§6.2):
@@ -160,19 +160,19 @@ export interface BrokerHandle {
    *   - Zero IPC clients for `idleExitMs` (default 5 min) → reason "idle".
    *
    * If the watcher EOFs but the probe succeeds (the watcher process itself
-   * was killed while tmux lives), the broker re-spawns the watcher and does
+   * was killed while tmux lives), the server-proxy re-spawns the watcher and does
    * NOT exit.
    */
-  onSelfExit(cb: (reason: BrokerSelfExitReason) => void): void;
+  onSelfExit(cb: (reason: ServerProxySelfExitReason) => void): void;
 
   /**
    * Toggle `synchronize-panes` for a tmux window (tc-7xv.12).
    *
-   * `windowId` is the daemon wire WindowId (e.g. `"w3"` for tmux window `@3`).
+   * `windowId` is the session-proxy wire WindowId (e.g. `"w3"` for tmux window `@3`).
    * `on` controls the desired state.
    *
    * Issues `tmux set-option -wt @<N> synchronize-panes on|off` synchronously.
-   * The daemon connected to the session will detect the change via the
+   * The session-proxy connected to the session will detect the change via the
    * `%window-option-changed` notification and push a `window.sync.changed`
    * delta to all connected clients.
    *
@@ -185,7 +185,7 @@ export interface BrokerHandle {
   /**
    * Set `monitor-activity` for a tmux window (tc-7xv.15).
    *
-   * `windowId` is the daemon wire WindowId (e.g. `"w3"` for tmux window `@3`).
+   * `windowId` is the session-proxy wire WindowId (e.g. `"w3"` for tmux window `@3`).
    * `on` controls the desired state.
    *
    * Issues `tmux set-option -wt @<N> monitor-activity on|off` synchronously.
@@ -197,7 +197,7 @@ export interface BrokerHandle {
   /**
    * Set `monitor-silence` for a tmux window (tc-7xv.15).
    *
-   * `windowId` is the daemon wire WindowId (e.g. `"w3"` for tmux window `@3`).
+   * `windowId` is the session-proxy wire WindowId (e.g. `"w3"` for tmux window `@3`).
    * `seconds` is the silence threshold (1..N), or 0/null to disable.
    *
    * Issues `tmux set-option -wt @<N> monitor-silence <seconds>` synchronously.
@@ -220,7 +220,7 @@ interface SessionEntry {
   tmuxId: string;
   name: string;
   windowCount: number;
-  /** Count of tmuxcc clients attached (tracked per daemon, 0 until a daemon is spawned) */
+  /** Count of tmuxcc clients attached (tracked per sessionProxy, 0 until a session-proxy is spawned) */
   attachedClientCount: number;
 }
 
@@ -235,10 +235,10 @@ interface ClientState {
 }
 
 // ---------------------------------------------------------------------------
-// Broker capabilities
+// ServerProxy capabilities
 // ---------------------------------------------------------------------------
 
-const BROKER_CAPABILITIES: Capabilities = {
+const SERVER_PROXY_CAPABILITIES: Capabilities = {
   protocolVersion: WIRE_PROTOCOL_VERSION,
   features: [
     "sessions-watch",
@@ -246,7 +246,7 @@ const BROKER_CAPABILITIES: Capabilities = {
     "session-destroy",
     "session-claim",
     "pane-attach", // tc-7xv.36
-    "broker-info", // tc-k6v
+    "server-proxy-info", // tc-k6v
   ],
 };
 
@@ -271,16 +271,16 @@ const WATCHER_RESPAWN_BACKOFF_INIT_MS = 250;
 const WATCHER_RESPAWN_BACKOFF_MAX_MS = 8_000;
 
 // ---------------------------------------------------------------------------
-// BrokerImpl
+// ServerProxyImpl
 // ---------------------------------------------------------------------------
 
-class BrokerImpl implements BrokerHandle {
-  private readonly _opts: BrokerOptions;
+class ServerProxyImpl implements ServerProxyHandle {
+  private readonly _opts: ServerProxyOptions;
   /**
    * The socket-name-derived identifier used as the runtime sub-directory.
-   * Equals `opts.socketName` so that broker socket paths are well-known and
-   * discoverable: `<runtime>/<socketName>/broker.sock`.
-   * One broker per tmux socket name — no UUID needed for isolation.
+   * Equals `opts.socketName` so that server-proxy socket paths are well-known and
+   * discoverable: `<runtime>/<socketName>/server-proxy.sock`.
+   * One server-proxy per tmux socket name — no UUID needed for isolation.
    */
   private readonly _socketDirName: string;
   private readonly _runtimeDirOpts: RuntimeDirOptions;
@@ -292,18 +292,18 @@ class BrokerImpl implements BrokerHandle {
   /** Name index: session name → SessionEntry (for fast lookups) */
   private _byName = new Map<string, SessionEntry>();
 
-  private _supervisor: DaemonSupervisor = createDaemonSupervisor();
+  private _supervisor: SessionProxySupervisor = createSessionProxySupervisor();
   private _watcher: TmuxWatcher | null = null;
   private _server: { close(): Promise<void> } | null = null;
   private _socketPath: string = "";
   private _started = false;
 
-  // ── tc-k6v broker.info state ────────────────────────────────────────────────
-  /** Date.now() when start() completed; drives `broker.info` uptimeMs. */
+  // ── tc-k6v server-proxy.info state ────────────────────────────────────────────────
+  /** Date.now() when start() completed; drives `server-proxy.info` uptimeMs. */
   private _startedAtMs = 0;
   /**
-   * Whether sessions already existed on the tmux socket when this broker
-   * started (ext-a §6.2 "adopted server").  Reported in `broker.info`.
+   * Whether sessions already existed on the tmux socket when this server-proxy
+   * started (ext-a §6.2 "adopted server").  Reported in `server-proxy.info`.
    */
   private _adoptedExistingServer = false;
 
@@ -318,7 +318,7 @@ class BrokerImpl implements BrokerHandle {
   private _selfExited = false;
   /** True while a watcher-EOF tmux probe is in flight. */
   private _probeInFlight = false;
-  private _selfExitHandlers: Array<(reason: BrokerSelfExitReason) => void> = [];
+  private _selfExitHandlers: Array<(reason: ServerProxySelfExitReason) => void> = [];
   /** When the current watcher was spawned (drives respawn backoff). */
   private _watcherSpawnedAt = 0;
   /** Backoff for the next respawn after a short-lived watcher. 0 = immediate. */
@@ -337,7 +337,7 @@ class BrokerImpl implements BrokerHandle {
    */
   private _claimLocks = new Map<string, Promise<{ sessionId: SessionId; endpoint: string; created: boolean }>>();
 
-  constructor(opts: BrokerOptions) {
+  constructor(opts: ServerProxyOptions) {
     this._opts = opts;
     this._socketDirName = opts.socketName;
     this._runtimeDirOpts = opts.runtimeDir !== undefined ? { runtimeDir: opts.runtimeDir } : {};
@@ -345,7 +345,7 @@ class BrokerImpl implements BrokerHandle {
   }
 
   endpoint(): string {
-    if (!this._started) throw new Error("Broker not started");
+    if (!this._started) throw new Error("ServerProxy not started");
     return this._socketPath;
   }
 
@@ -353,7 +353,7 @@ class BrokerImpl implements BrokerHandle {
     return this._ipcClientCount;
   }
 
-  onSelfExit(cb: (reason: BrokerSelfExitReason) => void): void {
+  onSelfExit(cb: (reason: ServerProxySelfExitReason) => void): void {
     this._selfExitHandlers.push(cb);
   }
 
@@ -415,10 +415,10 @@ class BrokerImpl implements BrokerHandle {
   // ── end tc-7xv.15 ─────────────────────────────────────────────────────────
 
   async start(): Promise<void> {
-    if (this._started) throw new Error("Broker already started");
+    if (this._started) throw new Error("ServerProxy already started");
     this._selfExited = false;
 
-    this._socketPath = brokerSocketPath(this._socketDirName, this._runtimeDirOpts);
+    this._socketPath = serverProxySocketPath(this._socketDirName, this._runtimeDirOpts);
 
     // Remove stale socket file if present
     removeSocket(this._socketPath);
@@ -444,7 +444,7 @@ class BrokerImpl implements BrokerHandle {
     this._refreshSessions();
 
     // tc-k6v: sessions present at start ⇒ the tmux server pre-existed this
-    // broker — it was "adopted", not minted by a later session.claim (§6.2).
+    // server-proxy — it was "adopted", not minted by a later session.claim (§6.2).
     this._adoptedExistingServer = this._sessions.size > 0;
 
     // Start tmux watcher for %sessions-changed notifications
@@ -453,14 +453,14 @@ class BrokerImpl implements BrokerHandle {
     // Wire supervisor crash handler (tc-ukq, ext-a §6.3 "Crash while the
     // server-proxy lives")
     this._supervisor.onCrash((sessionId, info) => {
-      this._onDaemonCrash(sessionId as SessionId, info);
+      this._onSessionProxyCrash(sessionId as SessionId, info);
     });
 
     this._started = true;
     this._startedAtMs = Date.now();
 
-    // Arm the idle-exit hysteresis: the broker starts with zero clients, and
-    // a launcher that crashes before connecting must not leak a broker.
+    // Arm the idle-exit hysteresis: the server-proxy starts with zero clients, and
+    // a launcher that crashes before connecting must not leak a server-proxy.
     this._startIdleTimer();
   }
 
@@ -522,7 +522,7 @@ class BrokerImpl implements BrokerHandle {
 
     void probeTmuxAlive(this._opts.socketName, TMUX_PROBE_TIMEOUT_MS).then((alive) => {
       this._probeInFlight = false;
-      // The broker may have been shut down (or self-exited) during the probe.
+      // The server-proxy may have been shut down (or self-exited) during the probe.
       if (!this._started || this._selfExited) return;
 
       if (alive) {
@@ -579,7 +579,7 @@ class BrokerImpl implements BrokerHandle {
         void this._selfExit("idle");
       }
     }, this._idleExitMs);
-    // The listening server keeps the event loop alive while the broker runs;
+    // The listening server keeps the event loop alive while the server-proxy runs;
     // unref so a pending hysteresis window never holds the loop on its own.
     timer.unref();
     this._idleTimer = timer;
@@ -593,12 +593,12 @@ class BrokerImpl implements BrokerHandle {
   }
 
   /**
-   * Self-exit: run a full shutdown (which unlinks the broker socket file —
+   * Self-exit: run a full shutdown (which unlinks the server-proxy socket file —
    * required so the next launcher's probe doesn't get connect-then-reset),
    * then notify onSelfExit listeners.  The entry point maps that notification
    * to `process.exit(0)`.
    */
-  private async _selfExit(reason: BrokerSelfExitReason): Promise<void> {
+  private async _selfExit(reason: ServerProxySelfExitReason): Promise<void> {
     if (this._selfExited || !this._started) return;
     this._selfExited = true;
 
@@ -620,41 +620,41 @@ class BrokerImpl implements BrokerHandle {
   }
 
   // ---------------------------------------------------------------------------
-  // Daemon crash handling (tc-ukq, ext-a §6.3 "Crash while the server-proxy lives")
+  // SessionProxy crash handling (tc-ukq, ext-a §6.3 "Crash while the server-proxy lives")
   // ---------------------------------------------------------------------------
 
   /**
-   * A session daemon exited unexpectedly (not via reapDaemon) while the
-   * broker lives — parser fault, OOM, stray SIGKILL.
+   * A session session-proxy exited unexpectedly (not via reapSessionProxy) while the
+   * server-proxy lives — parser fault, OOM, stray SIGKILL.
    *
    * By the time this runs the supervisor has already reaped its
-   * sessionId → daemon registry entry, so the next `session.claim` for this
-   * session spawns a fresh daemon against the still-alive tmux session.
-   * Respawn is LAZY (§6.2): a crashed daemon with no interested client stays
+   * sessionId → session-proxy registry entry, so the next `session.claim` for this
+   * session spawns a fresh session-proxy against the still-alive tmux session.
+   * Respawn is LAZY (§6.2): a crashed session-proxy with no interested client stays
    * gone — nothing is spawned here.
    *
    * Client notification is session-scoped by construction: clients attached
-   * to THAT session held connections to the dead daemon's socket, which the
-   * kernel closed when the process died.  Per SCHEMA.md ("Daemon errors"):
-   * after a daemon connection dies the client must consider it dead and
-   * reconnect through the broker — the connection close IS the wire-level
-   * signal.  No broker-wide message is sent; sibling sessions' daemons and
+   * to THAT session held connections to the dead session-proxy's socket, which the
+   * kernel closed when the process died.  Per SCHEMA.md ("SessionProxy errors"):
+   * after a session-proxy connection dies the client must consider it dead and
+   * reconnect through the server-proxy — the connection close IS the wire-level
+   * signal.  No server-proxy-wide message is sent; sibling sessions' daemons and
    * clients are untouched.
    *
-   * The same supervisor exit event also fires when the daemon exited because
-   * its bound tmux SESSION died (daemon-side `-CC` EOF / `%sessions-changed`
-   * handling) before the broker's own watcher refresh ran.  Disambiguate
+   * The same supervisor exit event also fires when the session-proxy exited because
+   * its bound tmux SESSION died (session-proxy-side `-CC` EOF / `%sessions-changed`
+   * handling) before the server-proxy's own watcher refresh ran.  Disambiguate
    * against tmux: `_refreshSessions()` keeps the session entry when the
-   * session is alive (daemon crash → no broker-wire delta; the session stays
+   * session is alive (session-proxy crash → no server-proxy-wire delta; the session stays
    * listed and claimable), or removes it and broadcasts `sessions.removed`
    * when it is gone (the SCHEMA-specified signal for genuine session
    * disappearance).
    */
-  private _onDaemonCrash(sessionId: SessionId, info: DaemonExitInfo): void {
+  private _onSessionProxyCrash(sessionId: SessionId, info: SessionProxyExitInfo): void {
     process.stderr.write(
-      `broker: daemon for session '${info.sessionName}' (${sessionId}) exited ` +
+      `serverProxy: session-proxy for session '${info.sessionName}' (${sessionId}) exited ` +
       `unexpectedly (code=${info.code}, signal=${info.signal}); ` +
-      `fresh daemon on next session.claim\n`,
+      `fresh session-proxy on next session.claim\n`,
     );
     if (!this._started || this._selfExited) return;
     this._refreshSessions();
@@ -679,7 +679,7 @@ class BrokerImpl implements BrokerHandle {
       if (!currentTmuxIds.has(entry.tmuxId)) {
         this._sessions.delete(sid);
         this._byName.delete(entry.name);
-        this._supervisor.reapDaemon(sid);
+        this._supervisor.reapSessionProxy(sid);
         this._broadcastRemoved(sid);
       }
     }
@@ -728,17 +728,17 @@ class BrokerImpl implements BrokerHandle {
   // ---------------------------------------------------------------------------
 
   private async _handleConnection(transport: Transport): Promise<void> {
-    // Run broker-wire handshake
+    // Run server-proxy-wire handshake
     let session: Awaited<ReturnType<typeof runServerHandshake>>;
     try {
-      session = await runServerHandshake(transport, BROKER_CAPABILITIES, "broker.capabilities");
+      session = await runServerHandshake(transport, SERVER_PROXY_CAPABILITIES, "server-proxy.capabilities");
     } catch (err) {
       try { transport.close(); } catch { /* ignore */ }
       return;
     }
     void session; // features not yet used in v3 alpha
 
-    // nextSeq starts at 2: the handshake itself sent seq=1 (broker.capabilities).
+    // nextSeq starts at 2: the handshake itself sent seq=1 (server-proxy.capabilities).
     // The snapshot is the second server-side message and therefore seq=2.
     const state: ClientState = { transport, nextSeq: 2 };
     this._clients.set(transport, state);
@@ -748,7 +748,7 @@ class BrokerImpl implements BrokerHandle {
     });
 
     // Send snapshot at seq=2 per SCHEMA.md handshake sequence:
-    //   broker.capabilities (seq=1) → client.capabilities (seq=1) → sessions.snapshot (seq=2)
+    //   server-proxy.capabilities (seq=1) → client.capabilities (seq=1) → sessions.snapshot (seq=2)
     const snapshot = this._buildSnapshot(state.nextSeq);
     state.nextSeq++;
     transport.sendControl(snapshot as unknown as Parameters<typeof transport.sendControl>[0]);
@@ -756,7 +756,7 @@ class BrokerImpl implements BrokerHandle {
     // Handle incoming commands
     transport.onControl((msg: MessageBase) => {
       if (msg.type === "command.request") {
-        void this._handleCommand(state, msg as unknown as BrokerCommandRequestMessage);
+        void this._handleCommand(state, msg as unknown as ServerProxyCommandRequestMessage);
       }
       // Other message types: emit protocol.unknown-message error
     });
@@ -766,8 +766,8 @@ class BrokerImpl implements BrokerHandle {
   // Snapshot
   // ---------------------------------------------------------------------------
 
-  private _buildSnapshot(seq: number): BrokerSnapshotMessage {
-    const sessions: BrokerSessionInfo[] = [];
+  private _buildSnapshot(seq: number): ServerProxySnapshotMessage {
+    const sessions: ServerProxySessionInfo[] = [];
     for (const entry of this._sessions.values()) {
       sessions.push({
         sessionId: entry.sessionId,
@@ -780,28 +780,28 @@ class BrokerImpl implements BrokerHandle {
   }
 
   // ---------------------------------------------------------------------------
-  // broker.info (tc-k6v)
+  // server-proxy.info (tc-k6v)
   // ---------------------------------------------------------------------------
 
   /**
-   * Build the read-only diagnostics snapshot for a `broker.info` command.
+   * Build the read-only diagnostics snapshot for a `server-proxy.info` command.
    *
    * Refreshes the session table first so counts are current, then augments
-   * each session row with the daemon PID (from the supervisor) and the pane
+   * each session row with the session-proxy PID (from the supervisor) and the pane
    * count (one `tmux list-panes -a` shell-out, tallied per session).  All
    * queries are cheap and synchronous; nothing is mutated beyond the routine
    * session-table refresh.
    */
-  private _buildInfo(): BrokerInfoPayload {
+  private _buildInfo(): ServerProxyInfoPayload {
     this._refreshSessions();
 
     const paneCounts = countPanesBySession(this._opts.socketName);
-    const sessions: BrokerInfoSession[] = [];
+    const sessions: ServerProxyInfoSession[] = [];
     for (const entry of this._sessions.values()) {
       sessions.push({
         sessionId: entry.sessionId,
         name: entry.name,
-        daemonPid: this._supervisor.daemonPid(entry.sessionId),
+        sessionProxyPid: this._supervisor.sessionProxyPid(entry.sessionId),
         windowCount: entry.windowCount,
         paneCount: paneCounts.get(entry.tmuxId) ?? 0,
         attachedClientCount: entry.attachedClientCount,
@@ -810,8 +810,8 @@ class BrokerImpl implements BrokerHandle {
 
     return {
       socketName: this._opts.socketName,
-      brokerSocketPath: this._socketPath,
-      brokerPid: process.pid,
+      serverProxySocketPath: this._socketPath,
+      serverProxyPid: process.pid,
       uptimeMs: Math.max(0, Date.now() - this._startedAtMs),
       tmuxServerPid: getTmuxServerPid(this._opts.socketName),
       adoptedExistingServer: this._adoptedExistingServer,
@@ -827,12 +827,12 @@ class BrokerImpl implements BrokerHandle {
 
   private async _handleCommand(
     state: ClientState,
-    req: BrokerCommandRequestMessage,
+    req: ServerProxyCommandRequestMessage,
   ): Promise<void> {
     const { correlationId, command } = req;
 
     try {
-      let payload: { sessionId?: SessionId; endpoint?: string; paneId?: PaneId; created?: boolean; ok?: true; info?: BrokerInfoPayload };
+      let payload: { sessionId?: SessionId; endpoint?: string; paneId?: PaneId; created?: boolean; ok?: true; info?: ServerProxyInfoPayload };
 
       switch (command.kind) {
         case "session.claim":
@@ -844,13 +844,13 @@ class BrokerImpl implements BrokerHandle {
         case "session.destroy":
           payload = await this._destroySession(command.sessionId);
           break;
-        case "broker.info":
+        case "server-proxy.info":
           // tc-k6v: read-only diagnostics snapshot for debug surfaces.
           payload = { info: this._buildInfo() };
           break;
         case "pane.attach":
-          // tc-7xv.36: attach intent for a specific pane.  The broker doesn't
-          // own pane-level state — it just ensures the daemon is running for
+          // tc-7xv.36: attach intent for a specific pane.  The server-proxy doesn't
+          // own pane-level state — it just ensures the session-proxy is running for
           // the named session and echoes the paneId back so the client has a
           // round-tripped acknowledgement of its targeted attach.
           payload = await this._attachPane(command.sessionId, command.paneId);
@@ -886,9 +886,9 @@ class BrokerImpl implements BrokerHandle {
 
   private _sendResponse(
     state: ClientState,
-    partial: Omit<BrokerCommandResponseMessage, "type" | "seq">,
+    partial: Omit<ServerProxyCommandResponseMessage, "type" | "seq">,
   ): void {
-    const msg: BrokerCommandResponseMessage = {
+    const msg: ServerProxyCommandResponseMessage = {
       type: "command.response",
       seq: state.nextSeq,
       ...partial,
@@ -906,7 +906,7 @@ class BrokerImpl implements BrokerHandle {
   // ---------------------------------------------------------------------------
 
   /**
-   * Claim or obtain the daemon endpoint for a named session.
+   * Claim or obtain the session-proxy endpoint for a named session.
    * Per-name serialization via _claimLocks.
    *
    * tc-3y8.2: the returned `created` flag reports whether THIS claim minted
@@ -981,7 +981,7 @@ class BrokerImpl implements BrokerHandle {
     }
 
     // tc-w61: mark-on-attach — ensure the Phase 2 @tmuxcc 1 marker is set on
-    // the session before starting the daemon.  For sessions created by
+    // the session before starting the session-proxy.  For sessions created by
     // createSession() above, the marker was already set inside createSession();
     // this call is effectively a no-op in that case (idempotent).  For
     // pre-existing sessions that tmuxcc is claiming for the first time (e.g. a
@@ -990,18 +990,18 @@ class BrokerImpl implements BrokerHandle {
     // on subsequent invocations.
     setSessionMarker(this._opts.socketName, entry.name);
 
-    // Ensure daemon is running
-    const daemonSockPath = daemonSocketPath(
+    // Ensure session-proxy is running
+    const sessionProxySockPath = sessionProxySocketPath(
       this._socketDirName,
       entry.sessionId,
       this._runtimeDirOpts,
     );
 
-    const endpoint = await this._supervisor.ensureDaemon(
+    const endpoint = await this._supervisor.ensureSessionProxy(
       entry.sessionId,
       entry.name,
       this._opts.socketName,
-      daemonSockPath,
+      sessionProxySockPath,
     );
 
     return { sessionId: entry.sessionId, endpoint, created };
@@ -1023,14 +1023,14 @@ class BrokerImpl implements BrokerHandle {
       );
     }
 
-    // Use claim semantics — create then spawn daemon.
+    // Use claim semantics — create then spawn session-proxy.
     const result = await this._claimSession(name);
 
     // tc-3y8.2: enforce mint-or-fail.  The checks above close the in-process
-    // races, but another tmux client (outside this broker) can still mint the
+    // races, but another tmux client (outside this serverProxy) can still mint the
     // name between our refresh and the underlying `new-session`.  The claim
     // path resolves that race by attaching (`created: false`); for
-    // session.create that outcome IS name-taken.  The session and daemon stay
+    // session.create that outcome IS name-taken.  The session and session-proxy stay
     // up — they belong to whoever created the session, exactly as if a
     // session.claim had been issued.
     if (!result.created) {
@@ -1046,22 +1046,22 @@ class BrokerImpl implements BrokerHandle {
   /**
    * Handle `pane.attach` (tc-7xv.36).
    *
-   * The broker doesn't track panes — it only knows about sessions.  This
+   * The server-proxy doesn't track panes — it only knows about sessions.  This
    * handler:
-   *   1. Verifies the named session exists in the broker's session table
+   *   1. Verifies the named session exists in the server-proxy's session table
    *      (after a refresh from tmux).
-   *   2. Ensures the per-session daemon is running and returns its endpoint
+   *   2. Ensures the per-session session-proxy is running and returns its endpoint
    *      (same path used by `session.claim`).
    *   3. Echoes the supplied `paneId` back to the client as an acknowledgement
    *      of the targeted-attach intent — the client uses it to drive its host-
    *      pty binding decision.
    *
    * Pane existence is NOT validated here.  If the pane has disappeared by the
-   * time the client connects to the daemon, the daemon's snapshot simply will
+   * time the client connects to the sessionProxy, the session-proxy's snapshot simply will
    * not contain it; the client is expected to detect the missing pane and
-   * surface a UI signal.  Validating in the broker would require the broker
-   * to inspect daemon-side state, which crosses the wire-contract invariant
-   * (the broker speaks in sessions, not panes).
+   * surface a UI signal.  Validating in the server-proxy would require the server-proxy
+   * to inspect session-proxy-side state, which crosses the wire-contract invariant
+   * (the server-proxy speaks in sessions, not panes).
    */
   private async _attachPane(
     sessionId: SessionId,
@@ -1079,7 +1079,7 @@ class BrokerImpl implements BrokerHandle {
       );
     }
 
-    // Ensure the daemon is up.  Reuse the same per-name claim semantics so
+    // Ensure the session-proxy is up.  Reuse the same per-name claim semantics so
     // concurrent pane.attach + session.claim requests share one spawn.
     const { endpoint } = await this._claimSession(entry.name);
 
@@ -1097,8 +1097,8 @@ class BrokerImpl implements BrokerHandle {
       );
     }
 
-    // Reap daemon first
-    this._supervisor.reapDaemon(sessionId);
+    // Reap session-proxy first
+    this._supervisor.reapSessionProxy(sessionId);
 
     // Kill the tmux session
     try {
@@ -1121,7 +1121,7 @@ class BrokerImpl implements BrokerHandle {
   // ---------------------------------------------------------------------------
 
   private _broadcastAdded(entry: SessionEntry): void {
-    const delta: Omit<BrokerSessionAddedMessage, "seq"> = {
+    const delta: Omit<ServerProxySessionAddedMessage, "seq"> = {
       type: "sessions.added",
       sessionId: entry.sessionId,
       name: entry.name,
@@ -1132,7 +1132,7 @@ class BrokerImpl implements BrokerHandle {
   }
 
   private _broadcastRemoved(sessionId: SessionId): void {
-    const delta: Omit<BrokerSessionRemovedMessage, "seq"> = {
+    const delta: Omit<ServerProxySessionRemovedMessage, "seq"> = {
       type: "sessions.removed",
       sessionId,
     };
@@ -1140,7 +1140,7 @@ class BrokerImpl implements BrokerHandle {
   }
 
   private _broadcastRenamed(sessionId: SessionId, newName: string): void {
-    const delta: Omit<BrokerSessionRenamedMessage, "seq"> = {
+    const delta: Omit<ServerProxySessionRenamedMessage, "seq"> = {
       type: "sessions.renamed",
       sessionId,
       newName,
@@ -1177,31 +1177,31 @@ function errorCode(err: unknown): string {
 // ---------------------------------------------------------------------------
 
 /**
- * Create a broker for the given tmux socket.
+ * Create a server-proxy for the given tmux socket.
  *
  * ```ts
- * const broker = createBroker({ socketName: "tmuxcc" });
- * await broker.start();
- * console.log("broker at", broker.endpoint());
- * // ... use the broker ...
- * await broker.shutdown();
+ * const serverProxy = createServerProxy({ socketName: "tmuxcc" });
+ * await serverProxy.start();
+ * console.log("server-proxy at", serverProxy.endpoint());
+ * // ... use the server-proxy ...
+ * await serverProxy.shutdown();
  * ```
  *
- * Lifecycle (tc-3iv, §6.2): the broker does not manage its own auto-spawn —
+ * Lifecycle (tc-3iv, §6.2): the server-proxy does not manage its own auto-spawn —
  * that is the launcher's job — but it DOES self-manage exit:
  *   - watcher EOF + failed 1 s `tmux ls` probe → immediate self-exit
  *     (tmux genuinely gone; mirrors tmux's own `exit-empty on` semantics)
  *   - watcher EOF + successful probe → re-spawn the watcher, keep serving
  *   - zero IPC clients for `idleExitMs` (default 5 min) → self-exit
  * Register `onSelfExit` to observe; both paths complete shutdown() — which
- * unlinks the broker socket file — before listeners run.  There is no
- * auto-restart layer: broker crashes are bugs to fix, not UX to smooth over.
- * Nor are there orphaned daemons to reap after a broker crash: daemons are
+ * unlinks the server-proxy socket file — before listeners run.  There is no
+ * auto-restart layer: server-proxy crashes are bugs to fix, not UX to smooth over.
+ * Nor are there orphaned daemons to reap after a server-proxy crash: daemons are
  * non-detached children that enforce die-with-parent themselves (tc-2c5 —
- * getppid watchdog installed in daemon-entry.ts).  Recovery is launcher →
- * fresh broker → fresh daemons on next session.claim → fresh `-CC attach`
+ * getppid watchdog installed in session-proxy-entry.ts).  Recovery is launcher →
+ * fresh server-proxy → fresh daemons on next session.claim → fresh `-CC attach`
  * to the surviving tmux sessions.
  */
-export function createBroker(opts: BrokerOptions): BrokerHandle {
-  return new BrokerImpl(opts);
+export function createServerProxy(opts: ServerProxyOptions): ServerProxyHandle {
+  return new ServerProxyImpl(opts);
 }
