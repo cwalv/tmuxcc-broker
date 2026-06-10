@@ -69,7 +69,7 @@ import { brokerSocketPath, daemonSocketPath, removeSocket, restrictSocket } from
 import { listSessions, createSession, killSession, createTmuxWatcher, probeTmuxAlive, setWindowSynchronizePanes, setWindowMonitorActivity, setWindowMonitorSilence, setSessionMarker } from "./tmux-south.js";
 import type { TmuxWatcher } from "./tmux-south.js";
 import { createDaemonSupervisor } from "./daemon-supervisor.js";
-import type { DaemonSupervisor } from "./daemon-supervisor.js";
+import type { DaemonSupervisor, DaemonExitInfo } from "./daemon-supervisor.js";
 import type { RuntimeDirOptions } from "./runtime-dir.js";
 
 // ---------------------------------------------------------------------------
@@ -420,15 +420,10 @@ class BrokerImpl implements BrokerHandle {
     // Start tmux watcher for %sessions-changed notifications
     this._watcher = this._spawnWatcher();
 
-    // Wire supervisor crash handler
-    this._supervisor.onCrash((sessionId) => {
-      // Daemon died unexpectedly — emit sessions.removed to all broker clients
-      const entry = this._sessions.get(sessionId as SessionId);
-      if (entry) {
-        this._sessions.delete(sessionId as SessionId);
-        this._byName.delete(entry.name);
-        this._broadcastRemoved(entry.sessionId);
-      }
+    // Wire supervisor crash handler (tc-ukq, ext-a §6.3 "Crash while the
+    // server-proxy lives")
+    this._supervisor.onCrash((sessionId, info) => {
+      this._onDaemonCrash(sessionId as SessionId, info);
     });
 
     this._started = true;
@@ -591,6 +586,47 @@ class BrokerImpl implements BrokerHandle {
         // Listener errors must not break the exit path
       }
     }
+  }
+
+  // ---------------------------------------------------------------------------
+  // Daemon crash handling (tc-ukq, ext-a §6.3 "Crash while the server-proxy lives")
+  // ---------------------------------------------------------------------------
+
+  /**
+   * A session daemon exited unexpectedly (not via reapDaemon) while the
+   * broker lives — parser fault, OOM, stray SIGKILL.
+   *
+   * By the time this runs the supervisor has already reaped its
+   * sessionId → daemon registry entry, so the next `session.claim` for this
+   * session spawns a fresh daemon against the still-alive tmux session.
+   * Respawn is LAZY (§6.2): a crashed daemon with no interested client stays
+   * gone — nothing is spawned here.
+   *
+   * Client notification is session-scoped by construction: clients attached
+   * to THAT session held connections to the dead daemon's socket, which the
+   * kernel closed when the process died.  Per SCHEMA.md ("Daemon errors"):
+   * after a daemon connection dies the client must consider it dead and
+   * reconnect through the broker — the connection close IS the wire-level
+   * signal.  No broker-wide message is sent; sibling sessions' daemons and
+   * clients are untouched.
+   *
+   * The same supervisor exit event also fires when the daemon exited because
+   * its bound tmux SESSION died (daemon-side `-CC` EOF / `%sessions-changed`
+   * handling) before the broker's own watcher refresh ran.  Disambiguate
+   * against tmux: `_refreshSessions()` keeps the session entry when the
+   * session is alive (daemon crash → no broker-wire delta; the session stays
+   * listed and claimable), or removes it and broadcasts `sessions.removed`
+   * when it is gone (the SCHEMA-specified signal for genuine session
+   * disappearance).
+   */
+  private _onDaemonCrash(sessionId: SessionId, info: DaemonExitInfo): void {
+    process.stderr.write(
+      `broker: daemon for session '${info.sessionName}' (${sessionId}) exited ` +
+      `unexpectedly (code=${info.code}, signal=${info.signal}); ` +
+      `fresh daemon on next session.claim\n`,
+    );
+    if (!this._started || this._selfExited) return;
+    this._refreshSessions();
   }
 
   // ---------------------------------------------------------------------------

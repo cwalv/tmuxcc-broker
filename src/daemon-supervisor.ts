@@ -51,8 +51,28 @@ interface DaemonEntry {
   ready: Promise<string>;
 }
 
-/** Called when a daemon exits unexpectedly while clients may be connected. */
-export type DaemonCrashHandler = (sessionId: string) => void;
+/**
+ * Exit details passed to the crash handler. `code`/`signal` come from the
+ * child's `exit` event — exactly one of them is non-null.
+ */
+export interface DaemonExitInfo {
+  /** Session name the daemon was bound to (for logging). */
+  sessionName: string;
+  /** Exit code, or null if the daemon was killed by a signal. */
+  code: number | null;
+  /** Terminating signal (e.g. "SIGKILL"), or null if the daemon exited on its own. */
+  signal: NodeJS.Signals | null;
+}
+
+/**
+ * Called when a daemon exits UNEXPECTEDLY (ext-a §6.3 "Crash while the
+ * server-proxy lives").  Intentional reaps (reapDaemon / reapAll) delete the
+ * registry entry before killing and therefore never reach this handler.
+ * By the time the handler runs, the supervisor has already reaped the
+ * sessionId → daemon registry entry, so the next ensureDaemon() for the
+ * session spawns a fresh daemon.
+ */
+export type DaemonCrashHandler = (sessionId: string, info: DaemonExitInfo) => void;
 
 // ---------------------------------------------------------------------------
 // Path to the daemon entry script
@@ -303,12 +323,37 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
 
     // Wire up crash detection AFTER readiness so "exited before READY" is a
     // spawn error, not a crash.
-    proc.once("exit", () => {
+    //
+    // tc-ukq (ext-a §6.3 "Crash while the server-proxy lives"): on unexpected
+    // exit the registry entry is reaped HERE, synchronously with the exit
+    // event, so the next ensureDaemon() spawns a fresh daemon.  Respawn is
+    // LAZY (§6.2): nothing is spawned until the next claim.
+    proc.once("exit", (code, signal) => {
+      const fire = () => {
+        const current = this._daemons.get(sessionId);
+        // Only treat as a crash if THIS process is still the registered
+        // daemon.  The proc identity check guards the ABA case: an old
+        // daemon's late exit event (delivered after reapDaemon() + a fresh
+        // spawn under the same sessionId) must not reap the healthy
+        // replacement entry.
+        if (current !== undefined && !(current instanceof Promise) && current.proc === proc) {
+          this._daemons.delete(sessionId);
+          this._crashHandler?.(sessionId, { sessionName, code, signal });
+        }
+      };
       const current = this._daemons.get(sessionId);
-      // Only fire crash if this entry is still registered (not intentionally reaped)
-      if (current !== undefined && !(current instanceof Promise)) {
-        this._daemons.delete(sessionId);
-        this._crashHandler?.(sessionId);
+      if (current instanceof Promise) {
+        // The exit raced ensureDaemon()'s `await spawnPromise` continuation:
+        // the map still holds the in-flight promise this entry will be
+        // registered under.  Re-check after it settles (ensureDaemon's
+        // continuation — registered first — replaces the promise with the
+        // entry before our continuation runs).
+        void current.then(
+          () => queueMicrotask(fire),
+          () => { /* spawn failed; ensureDaemon already removed the entry */ },
+        );
+      } else {
+        fire();
       }
     });
 
