@@ -162,6 +162,51 @@ export function countPanesBySession(socketName: string): Map<string, number> {
 }
 
 /**
+ * Count tmuxcc-owned `-CC` clients per session (tc-3y8.7).
+ *
+ * tmuxcc attaches its own control-mode clients to every claimed session:
+ *
+ *   - **Daemon** (`-CC attach -t <session>`): flags include `control-mode`
+ *     but NOT `no-output` or `ignore-size`.  One per claimed session.
+ *   - **Watcher** (`-CC attach -f no-output,ignore-size`): flags include
+ *     `control-mode`, `no-output`, AND `ignore-size`.  One per broker.
+ *
+ * Both are distinguishable from real human clients by the presence of
+ * `control-mode` in their `client_flags` — a tmux control-mode connection
+ * is never opened by a regular terminal user.
+ *
+ * Empirical evidence (tmux 3.4, tmuxcc test socket):
+ *   daemon client: `attached,focused,control-mode,UTF-8`
+ *   watcher client: `attached,focused,control-mode,ignore-size,no-output,UTF-8`
+ *
+ * Returns a map of tmux session id (e.g. `"$1"`) → count of tmuxcc-owned
+ * clients attached to that session.  An empty map is returned when the
+ * server is not running or has no clients.
+ */
+export function countTmuxccClientsBySession(socketName: string): Map<string, number> {
+  const counts = new Map<string, number>();
+  const result = spawnSync(
+    "tmux",
+    ["-L", socketName, "list-clients", "-F", "#{client_flags} #{session_id}"],
+    { encoding: "utf8", timeout: 5_000 },
+  );
+  if (result.status !== 0 || result.error) return counts;
+  for (const line of (result.stdout ?? "").trim().split("\n")) {
+    if (!line) continue;
+    const spaceIdx = line.lastIndexOf(" ");
+    if (spaceIdx < 0) continue;
+    const flags = line.slice(0, spaceIdx);
+    const sessionId = line.slice(spaceIdx + 1);
+    // `control-mode` is present on ALL tmuxcc-owned clients (daemon + watcher).
+    // Regular terminal users never open a control-mode connection.
+    if (flags.includes("control-mode")) {
+      counts.set(sessionId, (counts.get(sessionId) ?? 0) + 1);
+    }
+  }
+  return counts;
+}
+
+/**
  * Run `tmux -L <socketName> new-session -d -s <name>` to create a detached
  * session.  Throws if the command fails (including name-already-taken).
  *

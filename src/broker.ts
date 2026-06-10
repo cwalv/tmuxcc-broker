@@ -68,7 +68,7 @@ import type {
 
 import { createSocketServer, createSocketTransport } from "./socket-transport.js";
 import { brokerSocketPath, daemonSocketPath, removeSocket, restrictSocket } from "./runtime-dir.js";
-import { listSessions, createSession, killSession, createTmuxWatcher, probeTmuxAlive, setWindowSynchronizePanes, setWindowMonitorActivity, setWindowMonitorSilence, setSessionMarker, getTmuxServerPid, countPanesBySession } from "./tmux-south.js";
+import { listSessions, createSession, killSession, createTmuxWatcher, probeTmuxAlive, setWindowSynchronizePanes, setWindowMonitorActivity, setWindowMonitorSilence, setSessionMarker, getTmuxServerPid, countPanesBySession, countTmuxccClientsBySession } from "./tmux-south.js";
 import type { TmuxWatcher } from "./tmux-south.js";
 import { createDaemonSupervisor } from "./daemon-supervisor.js";
 import type { DaemonSupervisor, DaemonExitInfo } from "./daemon-supervisor.js";
@@ -666,6 +666,10 @@ class BrokerImpl implements BrokerHandle {
 
   private _refreshSessions(): void {
     const rows = listSessions(this._opts.socketName);
+    // tc-3y8.7: subtract tmuxcc-owned control-mode clients from the raw
+    // session_attached count so that attachedClientCount reflects only
+    // real (external) clients.
+    const tmuxccCounts = countTmuxccClientsBySession(this._opts.socketName);
 
     // Build a set of current tmux ids
     const currentTmuxIds = new Set(rows.map((r) => r.tmuxId));
@@ -688,6 +692,8 @@ class BrokerImpl implements BrokerHandle {
 
     // Detect additions and renames
     for (const row of rows) {
+      const ownCount = tmuxccCounts.get(row.tmuxId) ?? 0;
+      const externalCount = Math.max(0, row.attachedCount - ownCount);
       const existing = knownTmuxIds.get(row.tmuxId);
       if (!existing) {
         // New session
@@ -697,7 +703,7 @@ class BrokerImpl implements BrokerHandle {
           tmuxId: row.tmuxId,
           name: row.name,
           windowCount: row.windowCount,
-          attachedClientCount: row.attachedCount,
+          attachedClientCount: externalCount,
         };
         this._sessions.set(sessionId, entry);
         this._byName.set(row.name, entry);
@@ -712,7 +718,7 @@ class BrokerImpl implements BrokerHandle {
       } else {
         // Update counts
         existing.windowCount = row.windowCount;
-        existing.attachedClientCount = row.attachedCount;
+        existing.attachedClientCount = externalCount;
       }
     }
   }

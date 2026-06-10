@@ -570,6 +570,62 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
     mux.transport.close();
   });
 
+  it("I11 (tc-3y8.7): attachedClientCount is external-only — daemon+watcher do not inflate the count", async () => {
+    const { mux } = await connectToBroker(broker.endpoint());
+    const seq = { value: 1 };
+
+    // Claim a session.  This attaches two tmuxcc-owned control-mode clients:
+    //   1. the broker's watcher (flags: control-mode, ignore-size, no-output)
+    //   2. the session daemon (flags: control-mode)
+    // Wait a moment for the watcher to fully attach (it polls/attaches async).
+    const claimResp = await sendBrokerCommand(mux, { kind: "session.claim", name: "own-clients-test" }, seq);
+    assert.ok(claimResp.result.ok, `Claim failed: ${JSON.stringify(claimResp.result)}`);
+
+    // Give the watcher time to attach so session_attached is stable.
+    await waitFor(
+      () => findWatcherPids(socketName).length > 0,
+      5_000,
+      "watcher to attach to tmux server",
+    );
+    // A small additional wait for the tmux session_attached counter to settle.
+    await new Promise((r) => setTimeout(r, 500));
+
+    // snapshot via sessions.snapshot on a fresh broker connection — counts
+    // are refreshed by the broker when building the snapshot.
+    const { snapshot } = await connectToBroker(broker.endpoint());
+    const sessionInfo = snapshot.sessions.find((s) => s.name === "own-clients-test");
+    assert.ok(
+      sessionInfo,
+      `sessions.snapshot must include 'own-clients-test': ${JSON.stringify(snapshot.sessions)}`,
+    );
+    // With daemon + watcher attached but NO real human clients, external count = 0.
+    assert.equal(
+      sessionInfo.attachedClientCount,
+      0,
+      `attachedClientCount must be 0 (daemon and watcher are tmuxcc-owned, not external); got ${sessionInfo.attachedClientCount}`,
+    );
+
+    // Also verify via broker.info, which uses the same session-table entry.
+    const infoResp = await sendBrokerCommand(mux, { kind: "broker.info" }, seq);
+    assert.ok(infoResp.result.ok, `broker.info failed: ${JSON.stringify(infoResp.result)}`);
+    const info = (infoResp.result as {
+      ok: true;
+      payload: { info: import("@tmuxcc/daemon").BrokerInfoPayload };
+    }).payload.info;
+    const infoRow = info.sessions.find((s) => s.name === "own-clients-test");
+    assert.ok(
+      infoRow,
+      `broker.info sessions must include 'own-clients-test': ${JSON.stringify(info.sessions)}`,
+    );
+    assert.equal(
+      infoRow.attachedClientCount,
+      0,
+      `broker.info attachedClientCount must be 0 for external-only semantics; got ${infoRow.attachedClientCount}`,
+    );
+
+    mux.transport.close();
+  });
+
   it("I7: connect to daemon endpoint and run snapshot round-trip", async () => {
     const { mux } = await connectToBroker(broker.endpoint());
     const seq = { value: 1 };
