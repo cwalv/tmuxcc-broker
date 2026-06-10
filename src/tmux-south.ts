@@ -96,6 +96,13 @@ export function listSessions(socketName: string): TmuxSessionRow[] {
 /**
  * Run `tmux -L <socketName> new-session -d -s <name>` to create a detached
  * session.  Throws if the command fails (including name-already-taken).
+ *
+ * After a successful `new-session`, immediately sets the Phase 2 marker
+ * `@tmuxcc 1` on the session (tc-w61) so that `listTmuxccSessions` can
+ * surface it.  The `set-option` failure is intentionally non-fatal — if the
+ * marker cannot be set (extremely unusual), the session still exists and the
+ * daemon will start; the session just won't appear in the attach-picker until
+ * the marker is applied on the next claim.
  */
 export function createSession(socketName: string, name: string): void {
   const result = spawnSync(
@@ -108,6 +115,34 @@ export function createSession(socketName: string, name: string): void {
       `tmux new-session failed: ${result.stderr?.trim() ?? result.error?.message ?? "unknown error"}`,
     );
   }
+
+  // Set the @tmuxcc 1 marker so the Phase 2 probe can discover this session.
+  setSessionMarker(socketName, name);
+}
+
+/**
+ * Set the Phase 2 `@tmuxcc 1` user option on an existing tmux session.
+ *
+ * Used both immediately after `createSession` (new sessions) and on
+ * mark-on-attach (existing sessions that are being claimed by tmuxcc for
+ * the first time).  The `set-option` call is idempotent — re-setting
+ * `@tmuxcc 1` on an already-marked session is a no-op.
+ *
+ * Non-fatal: if `set-option` fails (e.g. the session was killed between
+ * `new-session` and this call), the error is silently ignored.  The caller
+ * can detect the missing marker via `listTmuxccSessions` if needed.
+ *
+ * Note: `set-option -t` does not support the `=<name>` literal-match prefix;
+ * we pass the session name directly.  tmuxcc session names are
+ * workspace-derived (stable, unique per workspace) so ambiguity is not a
+ * concern in practice.
+ */
+export function setSessionMarker(socketName: string, name: string): void {
+  spawnSync(
+    "tmux",
+    ["-L", socketName, "set-option", "-t", name, "@tmuxcc", "1"],
+    { encoding: "utf8", timeout: 3_000 },
+  );
 }
 
 /**

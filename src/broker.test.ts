@@ -458,6 +458,121 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
 });
 
 // ---------------------------------------------------------------------------
+// tc-w61: @tmuxcc marker integration tests (requires tmux)
+// ---------------------------------------------------------------------------
+
+describe("tc-w61: @tmuxcc 1 marker set on spawn / claim", { skip: !TMUX_AVAILABLE }, () => {
+  let broker: BrokerHandle;
+  let socketName: string;
+
+  beforeEach(async () => {
+    socketName = nextSocketName();
+    broker = createBroker({ socketName });
+    await broker.start();
+  });
+
+  afterEach(async () => {
+    await broker.shutdown();
+    spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
+  });
+
+  it("M1: session.claim sets @tmuxcc 1 on the spawned tmux session", async () => {
+    const { mux } = await connectToBroker(broker.endpoint());
+    const seq = { value: 1 };
+
+    const sessionName = "tc-w61-marker-spawn";
+    const resp = await sendBrokerCommand(mux, { kind: "session.claim", name: sessionName }, seq);
+    assert.ok(resp.result.ok, `session.claim failed: ${JSON.stringify(resp.result)}`);
+
+    // Verify @tmuxcc 1 is set on the real tmux session.
+    // `show-options -v` prints the raw value to stdout; exit 0 means the option is set.
+    const markerResult = spawnSync(
+      "tmux",
+      ["-L", socketName, "show-options", "-t", sessionName, "-v", "@tmuxcc"],
+      { encoding: "utf8", timeout: 3_000, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    assert.equal(markerResult.status, 0, "show-options must exit 0 (option is set)");
+    assert.equal(
+      (markerResult.stdout ?? "").trim(),
+      "1",
+      "@tmuxcc must be exactly '1' after session.claim",
+    );
+
+    mux.transport.close();
+  });
+
+  it("M2: session.create sets @tmuxcc 1 on the spawned tmux session", async () => {
+    const { mux } = await connectToBroker(broker.endpoint());
+    const seq = { value: 1 };
+
+    const sessionName = "tc-w61-marker-create";
+    const resp = await sendBrokerCommand(mux, { kind: "session.create", name: sessionName }, seq);
+    assert.ok(resp.result.ok, `session.create failed: ${JSON.stringify(resp.result)}`);
+
+    const markerResult = spawnSync(
+      "tmux",
+      ["-L", socketName, "show-options", "-t", sessionName, "-v", "@tmuxcc"],
+      { encoding: "utf8", timeout: 3_000, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    assert.equal(markerResult.status, 0, "show-options must exit 0 (option is set)");
+    assert.equal(
+      (markerResult.stdout ?? "").trim(),
+      "1",
+      "@tmuxcc must be exactly '1' after session.create",
+    );
+
+    mux.transport.close();
+  });
+
+  it("M3: mark-on-attach — claiming a pre-existing unmarked session sets @tmuxcc 1", async () => {
+    // Create a plain tmux session WITHOUT going through the broker (simulates
+    // a session the user created before tmuxcc was installed, or one they created
+    // with plain `tmux new-session`).
+    const sessionName = "tc-w61-preexisting";
+    const created = spawnSync(
+      "tmux",
+      ["-L", socketName, "new-session", "-d", "-s", sessionName],
+      { encoding: "utf8", timeout: 5_000 },
+    );
+    assert.equal(created.status, 0, "Pre-existing session creation must succeed");
+
+    // Confirm the marker is NOT set on the bare tmux session.
+    const before = spawnSync(
+      "tmux",
+      ["-L", socketName, "show-options", "-t", sessionName, "-v", "@tmuxcc"],
+      { encoding: "utf8", timeout: 3_000, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    // show-options exits non-zero or returns empty when the option is unset.
+    const beforeValue = (before.stdout ?? "").trim();
+    assert.ok(
+      before.status !== 0 || beforeValue !== "1",
+      "Pre-existing session must NOT have @tmuxcc 1 before claiming",
+    );
+
+    // Now claim the session through the broker.  This should trigger mark-on-attach.
+    const { mux } = await connectToBroker(broker.endpoint());
+    const seq = { value: 1 };
+    const resp = await sendBrokerCommand(mux, { kind: "session.claim", name: sessionName }, seq);
+    assert.ok(resp.result.ok, `session.claim failed: ${JSON.stringify(resp.result)}`);
+
+    // Verify the marker is now set.
+    const after = spawnSync(
+      "tmux",
+      ["-L", socketName, "show-options", "-t", sessionName, "-v", "@tmuxcc"],
+      { encoding: "utf8", timeout: 3_000, stdio: ["ignore", "pipe", "ignore"] },
+    );
+    assert.equal(after.status, 0, "show-options must exit 0 after claim");
+    assert.equal(
+      (after.stdout ?? "").trim(),
+      "1",
+      "@tmuxcc must be exactly '1' on pre-existing session after claim (mark-on-attach)",
+    );
+
+    mux.transport.close();
+  });
+});
+
+// ---------------------------------------------------------------------------
 // Race test (requires tmux)
 // ---------------------------------------------------------------------------
 

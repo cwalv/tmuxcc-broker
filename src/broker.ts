@@ -62,7 +62,7 @@ import type {
 
 import { createSocketServer, createSocketTransport } from "./socket-transport.js";
 import { brokerSocketPath, daemonSocketPath, removeSocket, restrictSocket } from "./runtime-dir.js";
-import { listSessions, createSession, killSession, createTmuxWatcher, setWindowSynchronizePanes, setWindowMonitorActivity, setWindowMonitorSilence } from "./tmux-south.js";
+import { listSessions, createSession, killSession, createTmuxWatcher, setWindowSynchronizePanes, setWindowMonitorActivity, setWindowMonitorSilence, setSessionMarker } from "./tmux-south.js";
 import { createDaemonSupervisor } from "./daemon-supervisor.js";
 import type { DaemonSupervisor } from "./daemon-supervisor.js";
 import type { RuntimeDirOptions } from "./runtime-dir.js";
@@ -602,6 +602,16 @@ class BrokerImpl implements BrokerHandle {
         }
       }
     }
+
+    // tc-w61: mark-on-attach — ensure the Phase 2 @tmuxcc 1 marker is set on
+    // the session before starting the daemon.  For sessions created by
+    // createSession() above, the marker was already set inside createSession();
+    // this call is effectively a no-op in that case (idempotent).  For
+    // pre-existing sessions that tmuxcc is claiming for the first time (e.g. a
+    // session the user manually created then attached via tmuxcc.attachToSession),
+    // this stamps them as tmuxcc-managed so they will appear in listTmuxccSessions
+    // on subsequent invocations.
+    setSessionMarker(this._opts.socketName, entry.name);
 
     // Ensure daemon is running
     const daemonSockPath = daemonSocketPath(
