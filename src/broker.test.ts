@@ -10,8 +10,8 @@
  * ## Integration tests (guarded by tmux availability)
  *
  * I1. spawn a broker on a test socket, connect as a client, receive snapshot.
- * I2. session.claim creates a session + daemon + returns endpoint.
- * I3. session.claim on existing session returns same endpoint.
+ * I2. session.claim creates a session + daemon + returns endpoint + created=true.
+ * I3. session.claim on existing session returns same endpoint, created=false.
  * I4. session.create fails if name is already taken.
  * I5. session.destroy kills session + reaps daemon.
  * I6. sessions.added delta is pushed to subscribers after session.claim.
@@ -20,7 +20,8 @@
  * ## Race test
  *
  * R1. 10 concurrent session.claim requests for the same name all receive
- *     the same sessionId + endpoint; only one daemon process is spawned.
+ *     the same sessionId + endpoint; only one daemon process is spawned;
+ *     exactly one response reports created=true (tc-3y8.2).
  *
  * # Cleanup
  *
@@ -311,21 +312,24 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
     assert.equal(snapshot.sessions.length, 0);
   });
 
-  it("I2: session.claim creates a session and daemon, returns endpoint", async () => {
+  it("I2: session.claim creates a session and daemon, returns endpoint + created=true", async () => {
     const { mux } = await connectToBroker(broker.endpoint());
     const seq = { value: 1 };
 
     const resp = await sendBrokerCommand(mux, { kind: "session.claim", name: "test-claim" }, seq);
 
     assert.ok(resp.result.ok, `Expected ok=true, got: ${JSON.stringify(resp.result)}`);
-    const payload = (resp.result as { ok: true; payload: { sessionId: string; endpoint: string } }).payload;
+    const payload = (resp.result as { ok: true; payload: { sessionId: string; endpoint: string; created: boolean } }).payload;
     assert.ok(payload.sessionId, "Missing sessionId");
     assert.ok(payload.endpoint, "Missing endpoint");
+    // tc-3y8.2: a claim that mints the session must report created=true —
+    // this is the client's authority for create-time-only profile apply.
+    assert.equal(payload.created, true, "claim that creates must report created=true");
 
     mux.transport.close();
   });
 
-  it("I3: session.claim on same name returns same sessionId + endpoint", async () => {
+  it("I3: session.claim on same name returns same sessionId + endpoint, created=false", async () => {
     const { mux } = await connectToBroker(broker.endpoint());
     const seq = { value: 1 };
 
@@ -335,11 +339,14 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
     assert.ok(resp1.result.ok);
     assert.ok(resp2.result.ok);
 
-    const p1 = (resp1.result as { ok: true; payload: { sessionId: string; endpoint: string } }).payload;
-    const p2 = (resp2.result as { ok: true; payload: { sessionId: string; endpoint: string } }).payload;
+    const p1 = (resp1.result as { ok: true; payload: { sessionId: string; endpoint: string; created: boolean } }).payload;
+    const p2 = (resp2.result as { ok: true; payload: { sessionId: string; endpoint: string; created: boolean } }).payload;
 
     assert.equal(p1.sessionId, p2.sessionId, "sessionId must be stable");
     assert.equal(p1.endpoint, p2.endpoint, "endpoint must be stable");
+    // tc-3y8.2: first claim creates, second attaches to the existing session.
+    assert.equal(p1.created, true, "first claim must report created=true");
+    assert.equal(p2.created, false, "second claim must report created=false (attach)");
 
     mux.transport.close();
   });
@@ -350,6 +357,12 @@ describe("broker – integration (requires tmux)", { skip: !TMUX_AVAILABLE }, ()
 
     const r1 = await sendBrokerCommand(mux, { kind: "session.create", name: "unique-sess" }, seq);
     assert.ok(r1.result.ok, `First create failed: ${JSON.stringify(r1.result)}`);
+    // tc-3y8.2: a successful session.create always mints → created=true.
+    assert.equal(
+      (r1.result as { ok: true; payload: { created: boolean } }).payload.created,
+      true,
+      "session.create must report created=true on success",
+    );
 
     const r2 = await sendBrokerCommand(mux, { kind: "session.create", name: "unique-sess" }, seq);
     assert.equal(r2.result.ok, false);
@@ -665,6 +678,14 @@ describe("broker – race test (requires tmux)", { skip: !TMUX_AVAILABLE }, () =
 
     assert.equal(sessionIds.size, 1, `Expected 1 unique sessionId, got ${sessionIds.size}: ${[...sessionIds]}`);
     assert.equal(endpoints.size, 1, `Expected 1 unique endpoint, got ${endpoints.size}: ${[...endpoints]}`);
+
+    // tc-3y8.2: exactly ONE of the racing claims may observe created=true —
+    // joined in-flight claims are remapped to created=false so create-time
+    // behaviour (profile apply) runs at most once per session creation.
+    const createdCount = responses.filter(
+      (r) => (r.result as { ok: true; payload: { created: boolean } }).payload.created === true,
+    ).length;
+    assert.equal(createdCount, 1, `Expected exactly 1 created=true response, got ${createdCount}`);
 
     // Clean up
     for (const { mux } of connections) {

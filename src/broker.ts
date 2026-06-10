@@ -308,8 +308,13 @@ class BrokerImpl implements BrokerHandle {
   /**
    * Per-name claim locks: maps session name → in-flight claim promise.
    * Concurrent claims for the same name share this promise.
+   *
+   * tc-3y8.2: only the claim that INITIATED the shared promise reports the
+   * promise's `created` value; joiners are remapped to `created: false` in
+   * `_claimSession` so exactly one claimant observes `created: true` per
+   * session creation (the authority for create-time-only profile apply).
    */
-  private _claimLocks = new Map<string, Promise<{ sessionId: SessionId; endpoint: string }>>();
+  private _claimLocks = new Map<string, Promise<{ sessionId: SessionId; endpoint: string; created: boolean }>>();
 
   constructor(opts: BrokerOptions) {
     this._opts = opts;
@@ -753,7 +758,7 @@ class BrokerImpl implements BrokerHandle {
     const { correlationId, command } = req;
 
     try {
-      let payload: { sessionId?: SessionId; endpoint?: string; paneId?: PaneId; ok?: true };
+      let payload: { sessionId?: SessionId; endpoint?: string; paneId?: PaneId; created?: boolean; ok?: true };
 
       switch (command.kind) {
         case "session.claim":
@@ -825,10 +830,20 @@ class BrokerImpl implements BrokerHandle {
   /**
    * Claim or obtain the daemon endpoint for a named session.
    * Per-name serialization via _claimLocks.
+   *
+   * tc-3y8.2: the returned `created` flag reports whether THIS claim minted
+   * the tmux session.  Joining an in-flight claim returns `created: false`
+   * regardless of the shared promise's outcome — the joiner did not initiate
+   * the creating claim, so exactly one claimant per session creation sees
+   * `created: true`.
    */
-  private _claimSession(name: string): Promise<{ sessionId: SessionId; endpoint: string }> {
+  private _claimSession(name: string): Promise<{ sessionId: SessionId; endpoint: string; created: boolean }> {
     const inFlight = this._claimLocks.get(name);
-    if (inFlight) return inFlight;
+    if (inFlight) {
+      // Joined claim: by the time this resolves the session exists; this
+      // caller did not create it.
+      return inFlight.then((r) => ({ ...r, created: false }));
+    }
 
     const promise = this._doClaimSession(name).finally(() => {
       // Only remove the lock if it's still THIS promise (not a newer one)
@@ -843,20 +858,27 @@ class BrokerImpl implements BrokerHandle {
 
   private async _doClaimSession(
     name: string,
-  ): Promise<{ sessionId: SessionId; endpoint: string }> {
+  ): Promise<{ sessionId: SessionId; endpoint: string; created: boolean }> {
     // Refresh session list from tmux
     this._refreshSessions();
 
     let entry = this._byName.get(name);
 
+    // tc-3y8.2: whether THIS claim minted the tmux session (vs attaching to a
+    // pre-existing one).  Reported to the client as the authority for
+    // create-time-only behaviour (profile apply).
+    let created = false;
+
     if (!entry) {
       // Session doesn't exist — create it
       try {
         createSession(this._opts.socketName, name);
+        created = true;
       } catch (err: unknown) {
         const msg = err instanceof Error ? err.message : String(err);
         if (msg.toLowerCase().includes("duplicate")) {
-          // Race: another process created it between our check and create
+          // Race: another process created it between our check and create —
+          // we attached to that process's session; `created` stays false.
           this._refreshSessions();
           entry = this._byName.get(name);
           if (!entry) {
@@ -904,23 +926,43 @@ class BrokerImpl implements BrokerHandle {
       daemonSockPath,
     );
 
-    return { sessionId: entry.sessionId, endpoint };
+    return { sessionId: entry.sessionId, endpoint, created };
   }
 
   private async _createSession(
     name: string,
-  ): Promise<{ sessionId: SessionId; endpoint: string }> {
+  ): Promise<{ sessionId: SessionId; endpoint: string; created: boolean }> {
     this._refreshSessions();
 
-    if (this._byName.has(name)) {
+    // tc-3y8.2: an in-flight claim counts as "name in use" — joining it via
+    // _claimSession would resolve with created=false, contradicting the
+    // session.create contract (a successful create always mints, so its
+    // response always reports created=true; otherwise it fails name-taken).
+    if (this._byName.has(name) || this._claimLocks.has(name)) {
       throw Object.assign(
         new Error(`Session name '${name}' is already in use`),
         { code: "session.name-taken" },
       );
     }
 
-    // Use claim semantics — create then spawn daemon
-    return this._claimSession(name);
+    // Use claim semantics — create then spawn daemon.
+    const result = await this._claimSession(name);
+
+    // tc-3y8.2: enforce mint-or-fail.  The checks above close the in-process
+    // races, but another tmux client (outside this broker) can still mint the
+    // name between our refresh and the underlying `new-session`.  The claim
+    // path resolves that race by attaching (`created: false`); for
+    // session.create that outcome IS name-taken.  The session and daemon stay
+    // up — they belong to whoever created the session, exactly as if a
+    // session.claim had been issued.
+    if (!result.created) {
+      throw Object.assign(
+        new Error(`Session name '${name}' is already in use`),
+        { code: "session.name-taken" },
+      );
+    }
+
+    return result;
   }
 
   /**
