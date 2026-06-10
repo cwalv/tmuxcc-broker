@@ -791,12 +791,14 @@ function errorCode(err: unknown): string {
  * ```
  *
  * Assumption on broker lifecycle supervision:
- * The broker does not manage its own auto-spawn or OS-level supervision.
- * Per SCHEMA.md "Broker lifecycle": "Broker process supervision (when the
- * broker starts, how it's restarted, how orphaned daemons are reaped after a
- * broker crash) is out of scope for the v3 spec — it is an implementation
- * concern of whatever launcher ships with each client." A launcher binary or
- * client-side autospawn is a Stage 3+ concern.
+ * The broker does not manage its own auto-spawn or OS-level supervision —
+ * when/how a broker is (re)started is the launcher's concern.  Per SCHEMA.md
+ * "Broker lifecycle" there are no orphaned daemons to reap after a broker
+ * crash: daemons are non-detached children that enforce die-with-parent
+ * themselves (tc-2c5 — getppid watchdog installed in daemon-entry.ts), so a
+ * dead broker never leaves serving orphans.  Recovery is launcher → fresh
+ * broker → fresh daemons on next session.claim → fresh `-CC attach` to the
+ * surviving tmux sessions.
  */
 export function createBroker(opts: BrokerOptions): BrokerHandle {
   return new BrokerImpl(opts);

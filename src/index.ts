@@ -12,9 +12,11 @@
  * See SCHEMA.md "Broker wire" for the full wire protocol spec.
  *
  * Assumption on lifecycle supervision:
- * The broker does not manage its own auto-spawn or OS-level supervision.
- * Per SCHEMA.md "Broker lifecycle", process supervision is out of scope for v3.
- * A launcher binary (Stage 3+) is needed for production autospawn.
+ * The broker does not manage its own auto-spawn or OS-level supervision —
+ * (re)starting brokers is the launcher's concern.  Daemons need no external
+ * supervision either: they are non-detached children that enforce
+ * die-with-parent themselves (tc-2c5), so a dead broker leaves no orphans;
+ * a fresh broker simply spawns fresh daemons against the surviving tmux state.
  */
 
 export { createBroker } from "./broker.js";

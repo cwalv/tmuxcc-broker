@@ -242,6 +242,11 @@ class DaemonSupervisorImpl implements DaemonSupervisor {
       daemonSpawnArgs(script, socketName, sessionName, daemonSockPath),
       {
         stdio: ["ignore", "pipe", "pipe"],
+        // tc-2c5 / ext-a §6.3 invariant: daemons are REGULAR children — never
+        // `detached: true`, no PID file, no "find my old daemons" on startup.
+        // Die-with-parent is enforced inside the daemon itself (getppid
+        // watchdog in daemon-entry.ts); recovery from broker death is a fresh
+        // broker spawning fresh daemons, never reclaiming old ones.
         detached: false,
         env: { ...process.env },
       },

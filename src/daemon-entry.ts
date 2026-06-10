@@ -7,12 +7,22 @@
  *   --socket-path  <path>   unix socket path the daemon should listen on
  *
  * Protocol:
- *   1. Parse arguments.
- *   2. Create a unix socket server on `--socket-path`.
- *   3. Create and start a daemon (createDaemon from @tmuxcc/daemon).
- *   4. Write "READY\n" to stdout so the supervisor knows we are listening.
- *   5. Accept client connections in a loop, calling daemon.addClient(transport).
- *   6. On SIGTERM: call daemon.stop() and exit cleanly.
+ *   1. Install the die-with-parent watchdog (tc-2c5, see below).
+ *   2. Parse arguments.
+ *   3. Create a unix socket server on `--socket-path`.
+ *   4. Create and start a daemon (createDaemon from @tmuxcc/daemon).
+ *   5. Write "READY\n" to stdout so the supervisor knows we are listening.
+ *   6. Accept client connections in a loop, calling daemon.addClient(transport).
+ *   7. On SIGTERM: call daemon.stop() and exit cleanly.
+ *
+ * Die-with-parent (tc-2c5, ext-a design §6.3): this process MUST die with the
+ * broker that spawned it.  A SIGKILLed broker delivers no signal to its
+ * children — they are silently reparented — so the daemon polls getppid()
+ * (1 s cadence) and self-SIGTERMs on reparenting, which lands in the graceful
+ * SIGTERM path below (detach the -CC client, close + remove the unix socket).
+ * There is NO orphan-and-reclaim: recovery from broker death is launcher →
+ * fresh broker → fresh daemons on next session.claim → fresh `-CC attach` to
+ * the surviving tmux sessions (tmux is the only persistence layer).
  *
  * This is the multiplexed-socket endpoint described in SCHEMA.md §"Data plane":
  * the same socket carries both control-plane (JSON) and data-plane (0xCC) traffic.
@@ -23,7 +33,7 @@
 import * as net from "node:net";
 import * as fs from "node:fs";
 import * as path from "node:path";
-import { createDaemon } from "@tmuxcc/daemon";
+import { createDaemon, installDieWithParent } from "@tmuxcc/daemon";
 import { createSocketTransport } from "./socket-transport.js";
 import { removeSocket, restrictSocket } from "./runtime-dir.js";
 
@@ -66,6 +76,13 @@ function parseArgs(): { socketName: string; sessionName: string; socketPath: str
 // ---------------------------------------------------------------------------
 
 async function main(): Promise<void> {
+  // tc-2c5: enforce die-with-parent BEFORE any other work so even a daemon
+  // that wedges during startup cannot outlive its broker.  Default behavior:
+  // on reparenting, self-SIGTERM (taking the graceful path installed below)
+  // with a hard-exit backstop.  Worst-case exit latency after broker death:
+  // 1 s poll + 1.5 s grace — inside the 3 s budget asserted by the e2e test.
+  installDieWithParent();
+
   const { socketName, sessionName, socketPath } = parseArgs();
 
   // Remove stale socket file if present
