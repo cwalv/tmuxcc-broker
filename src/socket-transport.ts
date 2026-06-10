@@ -345,6 +345,22 @@ export function connectSocketTransport(socketPath: string): Promise<Transport> {
   });
 }
 
+/** Options for createSocketServer. */
+export interface SocketServerOptions {
+  /**
+   * Invoked with the new connection count whenever a connection is accepted
+   * or an accepted connection fully closes (tc-3iv idle-exit tracking).
+   *
+   * Counting happens at the raw `net.Socket` level — NOT via
+   * `Transport.onClose` — because the transport's close handler is a
+   * single-slot field that the wire handshake temporarily replaces; a
+   * connection that dies mid-handshake would leak a transport-level count.
+   * A socket `close` event fires exactly once per accepted connection, no
+   * matter how the connection ends.
+   */
+  onConnectionCountChange?: (count: number) => void;
+}
+
 /**
  * Start a unix socket server. Each accepted connection is wrapped as a
  * Transport and passed to `onConnection`.
@@ -354,9 +370,17 @@ export function connectSocketTransport(socketPath: string): Promise<Transport> {
 export function createSocketServer(
   socketPath: string,
   onConnection: (transport: Transport) => void,
+  opts: SocketServerOptions = {},
 ): Promise<{ close(): Promise<void> }> {
   return new Promise((resolve, reject) => {
+    let connectionCount = 0;
     const server = net.createServer((socket) => {
+      connectionCount++;
+      opts.onConnectionCountChange?.(connectionCount);
+      socket.once("close", () => {
+        connectionCount--;
+        opts.onConnectionCountChange?.(connectionCount);
+      });
       onConnection(new SocketTransport(socket));
     });
 

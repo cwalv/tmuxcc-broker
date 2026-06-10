@@ -10,25 +10,43 @@
  *
  * For state reads the broker shells out to `tmux list-sessions` etc.
  *
- * # Reconnect
+ * # Watcher lifecycle (tc-3iv, ext-a-design-context.md §6.2)
  *
- * If the `tmux -CC` connection drops, we reconnect with exponential backoff
- * (starting at 250 ms, doubling up to 8 s).  A caller-supplied `onChanged`
- * callback is invoked each time a `%sessions-changed` line is received,
- * and once on reconnect (to force a full refresh since we may have missed
- * notifications during the outage).
+ * A watcher instance is single-flight:
  *
- * # Notes on `tmux -CC attach` without an existing session
+ *   1. Pre-attach: while no session exists, poll `list-sessions` with
+ *      exponential backoff (250 ms doubling up to 8 s) until a session
+ *      appears, then attach.  `tmux -CC attach` requires at least one
+ *      session — with `exit-empty on` (the modern default) "no sessions"
+ *      also means "no server", so there is nothing to attach to yet.
+ *   2. Attached: invoke `onChanged` for each `%sessions-changed` line.
+ *   3. EOF: when the attached `-CC` process exits for ANY reason, invoke
+ *      `onEof` exactly once and go inert.  The watcher does NOT reconnect
+ *      on its own — the owner (the broker) disambiguates via
+ *      `probeTmuxAlive` and either re-spawns a fresh watcher (watcher died,
+ *      tmux alive) or self-exits (tmux genuinely gone).
  *
- * `tmux -CC attach` requires at least one session to exist.  If none exists,
- * tmux exits immediately.  The broker handles this by deferring the connection
- * attempt until after the first session is created, and reconnecting after
- * session creation commands.
+ * `onEof` is never invoked after `stop()` (e.g. for the SIGTERM that
+ * `stop()` itself delivers to the `-CC` child).
+ *
+ * # Why the watcher runs through the PTY bridge
+ *
+ * tmux's client calls tcgetattr() on stdin even in `-CC` control mode; with
+ * stdin on a plain pipe (or /dev/null) it exits immediately with "tcgetattr
+ * failed: Inappropriate ioctl for device".  A direct `child_process.spawn`
+ * watcher therefore dies instantly and silently degrades into a poller.
+ * The watcher reuses the daemon's `createTmuxHost` (python PTY bridge) so the
+ * `-CC` connection is genuinely live — required for EOF to be a meaningful
+ * tmux-death signal.  It attaches with client flags `no-output,ignore-size`:
+ * the thin watcher must not receive pane output (§6.2 "do NOT process pane
+ * events") and must not influence session sizing for real clients.
  *
  * @module tmux-south
  */
 
 import { spawn, spawnSync, type ChildProcess } from "node:child_process";
+import { createTmuxHost } from "@tmuxcc/daemon";
+import type { TmuxHost } from "@tmuxcc/daemon";
 
 // ---------------------------------------------------------------------------
 // Types
@@ -36,6 +54,12 @@ import { spawn, spawnSync, type ChildProcess } from "node:child_process";
 
 /** Handler invoked when session state may have changed. */
 export type SessionsChangedHandler = () => void;
+
+/**
+ * Handler invoked exactly once when an attached `-CC` watcher process EOFs
+ * (exits).  Not invoked for pre-attach poll retries, and not after `stop()`.
+ */
+export type WatcherEofHandler = () => void;
 
 /** Returned by createTmuxWatcher — call stop() to close. */
 export interface TmuxWatcher {
@@ -253,36 +277,95 @@ export function killSession(socketName: string, id: string): void {
 }
 
 // ---------------------------------------------------------------------------
+// tmux liveness probe (tc-3iv)
+// ---------------------------------------------------------------------------
+
+/**
+ * Probe whether the tmux server on `socketName` is alive by running
+ * `tmux -L <socketName> ls` with a hard timeout (§6.2 watcher-EOF
+ * disambiguation).
+ *
+ * Resolves `true` iff the command exits with status 0 within `timeoutMs`.
+ * Any other outcome — non-zero exit ("no server running on …"), spawn
+ * failure, or timeout — resolves `false`.
+ *
+ * Async (unlike the other helpers in this module) so the broker stays
+ * responsive to connected clients during the probe window.
+ */
+export function probeTmuxAlive(socketName: string, timeoutMs: number): Promise<boolean> {
+  return new Promise((resolve) => {
+    let settled = false;
+    const settle = (alive: boolean): void => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      resolve(alive);
+    };
+
+    let proc: ChildProcess;
+    try {
+      proc = spawn("tmux", ["-L", socketName, "ls"], { stdio: "ignore" });
+    } catch {
+      resolve(false);
+      return;
+    }
+
+    const timer = setTimeout(() => {
+      try {
+        proc.kill("SIGKILL");
+      } catch {
+        // ignore
+      }
+      settle(false);
+    }, timeoutMs);
+    timer.unref();
+
+    proc.on("exit", (code) => {
+      settle(code === 0);
+    });
+    proc.on("error", () => {
+      settle(false);
+    });
+  });
+}
+
+// ---------------------------------------------------------------------------
 // %sessions-changed watcher
 // ---------------------------------------------------------------------------
 
-/** Exponential backoff configuration. */
-const BACKOFF_INIT_MS = 250;
-const BACKOFF_MAX_MS = 8_000;
-const BACKOFF_FACTOR = 2;
+/** Pre-attach poll backoff configuration. */
+const POLL_INIT_MS = 250;
+const POLL_MAX_MS = 8_000;
+const POLL_FACTOR = 2;
 
 /**
- * Start a long-lived `tmux -L <socketName> -CC attach` process and invoke
- * `onChanged` whenever `%sessions-changed` appears in its output.
+ * Start a single-flight `tmux -L <socketName> -CC attach` watcher (see the
+ * module doc's "Watcher lifecycle" section).
  *
- * The watcher reconnects automatically with exponential backoff when the
- * process exits (e.g. tmux server restarted, no sessions).
+ * - `onChanged` fires for each `%sessions-changed` line, and once per
+ *   pre-attach poll tick (to force a full refresh — sessions may have been
+ *   created externally while we had nothing to attach to).
+ * - `onEof` fires exactly once when the attached `-CC` process exits, after
+ *   which the watcher is inert.  The owner decides whether to re-spawn a
+ *   fresh watcher or self-exit (probe disambiguation, §6.2).
  *
- * `onChanged` is also invoked on each reconnect to force a full state refresh.
- *
- * Returns a `TmuxWatcher` handle whose `stop()` method terminates the watcher.
+ * Returns a `TmuxWatcher` handle whose `stop()` method terminates the watcher
+ * (and suppresses `onEof` for the resulting child exit).
  */
 export function createTmuxWatcher(
   socketName: string,
   onChanged: SessionsChangedHandler,
+  onEof: WatcherEofHandler,
 ): TmuxWatcher {
   let stopped = false;
-  let currentProc: ChildProcess | null = null;
-  let backoffMs = BACKOFF_INIT_MS;
-  let reconnectTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set after onEof fired — the instance is inert from then on. */
+  let done = false;
+  let currentHost: TmuxHost | null = null;
+  let pollMs = POLL_INIT_MS;
+  let pollTimer: ReturnType<typeof setTimeout> | null = null;
 
   function connect(): void {
-    if (stopped) return;
+    if (stopped || done) return;
 
     // Check if the server is actually running before attaching.
     // `tmux -CC attach` without sessions exits immediately; we defer until
@@ -290,7 +373,7 @@ export function createTmuxWatcher(
     const rows = listSessions(socketName);
     if (rows.length === 0) {
       // Nothing to attach to yet — schedule a retry
-      scheduleReconnect();
+      schedulePoll();
       return;
     }
 
@@ -298,62 +381,67 @@ export function createTmuxWatcher(
     // doesn't try to attach to the most-recently-used session interactively.
     const target = rows[0]?.name ?? "";
 
-    // Spawn `tmux -L <socketName> -CC attach-session -t <name>` with stdio as
-    // pipes (we need stdout for control-mode output).
-    // Do NOT pass `-d` here: the `-d` flag causes tmux to detach ALL OTHER
-    // clients from the session, including any daemon's own `-CC attach-session`
-    // connection.  The watcher only needs to receive `%sessions-changed`
-    // notifications; it must not disrupt other attached clients.
-    const proc = spawn(
-      "tmux",
-      ["-L", socketName, "-CC", "attach-session", "-t", target],
-      {
-        stdio: ["ignore", "pipe", "ignore"],
-        detached: false,
-      },
-    );
+    // Attach via the PTY bridge (see module doc): tmux's client requires a
+    // TTY on stdin even in control mode.  Client flags:
+    //   no-output   — suppress %output blocks; the watcher only consumes
+    //                 session-lifecycle notifications (§6.2)
+    //   ignore-size — a thin 220x50 watcher must not drive session resizing
+    //                 for daemons / real clients attached to the same session
+    // Note: no `-d` — detaching other clients would disrupt daemon attaches.
+    const host = createTmuxHost({
+      socketName,
+      sessionName: target,
+      attach: true,
+      args: ["-f", "no-output,ignore-size"],
+    });
+    currentHost = host;
 
-    currentProc = proc;
-    // Unref so this child process doesn't keep the Node.js event loop alive.
-    proc.unref();
     let lineBuf = "";
+    let eofFired = false;
 
-    proc.stdout?.on("data", (chunk: Buffer) => {
-      lineBuf += chunk.toString("utf8");
+    // The host can report exit and (spawn) error; fire onEof at most once.
+    const fireEof = (): void => {
+      if (eofFired) return;
+      eofFired = true;
+      currentHost = null;
+      done = true;
+      if (!stopped) onEof();
+    };
+
+    host.onData((chunk: Uint8Array) => {
+      lineBuf += Buffer.from(chunk).toString("utf8");
       const lines = lineBuf.split("\n");
       lineBuf = lines.pop() ?? "";
       for (const line of lines) {
         if (line.trimStart().startsWith("%sessions-changed")) {
-          backoffMs = BACKOFF_INIT_MS; // reset backoff on healthy activity
           onChanged();
         }
       }
     });
 
-    proc.on("exit", () => {
-      currentProc = null;
-      if (!stopped) {
-        scheduleReconnect();
-      }
+    host.onExit(() => {
+      fireEof();
     });
+    // Register an error handler so stream errors are not re-emitted as
+    // uncaughtException by the host; lifecycle is handled via onExit/catch.
+    host.onError(() => {});
 
-    proc.on("error", () => {
-      currentProc = null;
-      if (!stopped) {
-        scheduleReconnect();
-      }
+    void host.start().catch(() => {
+      fireEof();
     });
   }
 
-  function scheduleReconnect(): void {
-    if (stopped) return;
-    reconnectTimer = setTimeout(() => {
-      reconnectTimer = null;
-      // Notify on reconnect so the broker does a full refresh
+  function schedulePoll(): void {
+    if (stopped || done) return;
+    pollTimer = setTimeout(() => {
+      pollTimer = null;
+      // Notify on each poll tick so the broker does a full refresh
       onChanged();
       connect();
-      backoffMs = Math.min(backoffMs * BACKOFF_FACTOR, BACKOFF_MAX_MS);
-    }, backoffMs);
+      pollMs = Math.min(pollMs * POLL_FACTOR, POLL_MAX_MS);
+    }, pollMs);
+    // Don't let a pending pre-attach poll keep the event loop alive.
+    pollTimer.unref();
   }
 
   // Start immediately
@@ -362,17 +450,14 @@ export function createTmuxWatcher(
   return {
     stop(): void {
       stopped = true;
-      if (reconnectTimer !== null) {
-        clearTimeout(reconnectTimer);
-        reconnectTimer = null;
+      if (pollTimer !== null) {
+        clearTimeout(pollTimer);
+        pollTimer = null;
       }
-      if (currentProc) {
-        try {
-          currentProc.kill("SIGTERM");
-        } catch {
-          // ignore
-        }
-        currentProc = null;
+      if (currentHost) {
+        // Fire-and-forget: TmuxHost.stop() escalates to SIGKILL internally.
+        void currentHost.stop();
+        currentHost = null;
       }
     },
   };

@@ -33,9 +33,12 @@
 import { describe, it, beforeEach, afterEach } from "node:test";
 import assert from "node:assert/strict";
 import { spawnSync } from "node:child_process";
+import * as fs from "node:fs";
+import * as os from "node:os";
+import * as path from "node:path";
 
 import { createBroker, connectSocketTransport, brokerSocketPath } from "./index.js";
-import type { BrokerHandle } from "./index.js";
+import type { BrokerHandle, BrokerSelfExitReason } from "./index.js";
 import type { Transport } from "@tmuxcc/daemon";
 
 import {
@@ -57,12 +60,52 @@ import type {
 let testCounter = 0;
 
 function nextSocketName(): string {
-  return `tmuxcc-test-broker-${++testCounter}-${Date.now()}`;
+  return `tmuxcc-test-broker-${process.pid}-${++testCounter}-${Date.now()}`;
 }
 
 function tmuxAvailable(): boolean {
   const r = spawnSync("tmux", ["-V"], { stdio: "ignore", timeout: 2_000 });
   return r.status === 0 && !r.error;
+}
+
+/** Poll `predicate` every `intervalMs` until truthy; throw on timeout. */
+async function waitFor(
+  predicate: () => boolean,
+  timeoutMs: number,
+  what: string,
+  intervalMs = 25,
+): Promise<void> {
+  const deadline = Date.now() + timeoutMs;
+  for (;;) {
+    if (predicate()) return;
+    if (Date.now() > deadline) throw new Error(`Timeout (${timeoutMs}ms) waiting for ${what}`);
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
+/**
+ * PIDs of live thin-watcher tmux `-CC` client processes for a socket name.
+ *
+ * The `^tmux ` anchor matches only the tmux client itself, not the python
+ * PTY-bridge parent (whose cmdline also contains the same substring).
+ */
+function findWatcherPids(socketName: string): number[] {
+  const r = spawnSync("pgrep", ["-f", `^tmux -L ${socketName} -CC`], {
+    encoding: "utf8",
+    timeout: 5_000,
+  });
+  if (r.status !== 0 || r.error) return []; // pgrep exits 1 on no match
+  return r.stdout
+    .trim()
+    .split("\n")
+    .filter(Boolean)
+    .map((s) => parseInt(s, 10))
+    .filter((n) => !Number.isNaN(n));
+}
+
+/** mkdtemp a per-test runtime dir (removed in the test's finally block). */
+function makeRuntimeDir(label: string): string {
+  return fs.mkdtempSync(path.join(os.tmpdir(), `tmuxcc-test-${label}-`));
 }
 
 /** Returns a Promise that rejects after `ms` milliseconds. The timeout is cleared if `signal` resolves. */
@@ -626,6 +669,189 @@ describe("broker – race test (requires tmux)", { skip: !TMUX_AVAILABLE }, () =
     // Clean up
     for (const { mux } of connections) {
       mux.transport.close();
+    }
+  });
+});
+
+// ---------------------------------------------------------------------------
+// Self-exit lifecycle tests (tc-3iv, ext-a-design-context.md §6.2)
+// ---------------------------------------------------------------------------
+
+describe("broker – self-exit: idle hysteresis (tc-3iv)", () => {
+  it("S1: zero IPC clients past hysteresis → self-exit, socket unlinked, respawn works", async () => {
+    const socketName = nextSocketName();
+    const runtimeDir = makeRuntimeDir("s1");
+    // Injected short hysteresis — do NOT literally wait 5 minutes in tests.
+    const broker = createBroker({ socketName, runtimeDir, idleExitMs: 500 });
+    const exits: BrokerSelfExitReason[] = [];
+    broker.onSelfExit((reason) => exits.push(reason));
+    await broker.start();
+    const endpoint = broker.endpoint();
+
+    try {
+      assert.ok(fs.existsSync(endpoint), "socket file must exist after start");
+      assert.equal(broker.connectedClientCount, 0);
+
+      // Connect a raw client — "client" means ANY open unix-domain connection,
+      // counted before (and regardless of) the wire handshake.
+      const t = await connectSocketTransport(endpoint);
+      await waitFor(() => broker.connectedClientCount === 1, 2_000, "clientCount 0→1 on connect");
+
+      // Disconnect — count drops and the hysteresis window restarts.
+      t.close();
+      await waitFor(() => broker.connectedClientCount === 0, 2_000, "clientCount 1→0 on disconnect");
+
+      // Idle window elapses → broker self-exits and unlinks its socket.
+      await waitFor(() => exits.length > 0, 3_000, "idle self-exit");
+      assert.deepEqual(exits, ["idle"]);
+      assert.equal(
+        fs.existsSync(endpoint),
+        false,
+        "socket file must be unlinked on self-exit (next launcher probe must not connect-then-reset)",
+      );
+
+      // A subsequent spawn on the same socket name + runtime dir must succeed
+      // (no EADDRINUSE from a leftover socket file) and must accept clients.
+      const broker2 = createBroker({ socketName, runtimeDir, idleExitMs: 60_000 });
+      try {
+        await broker2.start();
+        assert.equal(broker2.endpoint(), endpoint, "respawn binds the same well-known path");
+        const t2 = await connectSocketTransport(broker2.endpoint());
+        await waitFor(() => broker2.connectedClientCount === 1, 2_000, "respawned broker accepts clients");
+        t2.close();
+      } finally {
+        await broker2.shutdown();
+      }
+    } finally {
+      await broker.shutdown(); // idempotent after self-exit
+      fs.rmSync(runtimeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("S2: connected-but-idle client keeps the broker alive past the hysteresis window", async () => {
+    const socketName = nextSocketName();
+    const runtimeDir = makeRuntimeDir("s2");
+    const broker = createBroker({ socketName, runtimeDir, idleExitMs: 400 });
+    const exits: BrokerSelfExitReason[] = [];
+    broker.onSelfExit((reason) => exits.push(reason));
+    await broker.start();
+    const endpoint = broker.endpoint();
+
+    try {
+      // Connect and then do nothing — no handshake, no commands.  A
+      // connected-but-idle client must keep the broker alive (§6.2: "client"
+      // is NOT "has bound a terminal" or "has claimed a session").
+      const t = await connectSocketTransport(endpoint);
+      await waitFor(() => broker.connectedClientCount === 1, 2_000, "clientCount 0→1 on connect");
+
+      // Sit idle for well over the hysteresis window.
+      await new Promise((r) => setTimeout(r, 1_000));
+
+      assert.equal(exits.length, 0, "broker must NOT self-exit while a client is connected");
+      assert.ok(fs.existsSync(endpoint), "socket file must still exist");
+      assert.equal(broker.connectedClientCount, 1, "client still counted");
+
+      t.close();
+      await waitFor(() => broker.connectedClientCount === 0, 2_000, "clientCount 1→0 on disconnect");
+    } finally {
+      await broker.shutdown();
+      fs.rmSync(runtimeDir, { recursive: true, force: true });
+    }
+  });
+});
+
+describe("broker – self-exit: tmux death & watcher respawn (tc-3iv, requires tmux)", { skip: !TMUX_AVAILABLE }, () => {
+  it("S3: tmux kill-server → broker self-exits within 2s and unlinks its socket", async () => {
+    const socketName = nextSocketName();
+    const runtimeDir = makeRuntimeDir("s3");
+
+    // Seed a session FIRST so the broker's thin -CC watcher can attach.
+    const seeded = spawnSync("tmux", ["-L", socketName, "new-session", "-d", "-s", "seed"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(seeded.status, 0, `tmux new-session failed: ${seeded.stderr}`);
+
+    // Long idle window so only the tmux-death path can trigger exit.
+    const broker = createBroker({ socketName, runtimeDir, idleExitMs: 600_000 });
+    const exits: BrokerSelfExitReason[] = [];
+    let exitedAt = 0;
+    broker.onSelfExit((reason) => {
+      exits.push(reason);
+      exitedAt = Date.now();
+    });
+    await broker.start();
+    const endpoint = broker.endpoint();
+
+    try {
+      // The exit trigger is watcher EOF — wait for the watcher to be attached.
+      await waitFor(() => findWatcherPids(socketName).length > 0, 5_000, "watcher attach");
+
+      const killedAt = Date.now();
+      spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
+
+      await waitFor(() => exits.length > 0, 2_000, "self-exit after kill-server");
+      assert.deepEqual(exits, ["tmux-gone"]);
+      assert.ok(
+        exitedAt - killedAt <= 2_000,
+        `self-exit took ${exitedAt - killedAt}ms — must be within 2s of kill-server`,
+      );
+      assert.equal(fs.existsSync(endpoint), false, "socket file must be unlinked on self-exit");
+    } finally {
+      await broker.shutdown(); // idempotent after self-exit
+      spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
+      fs.rmSync(runtimeDir, { recursive: true, force: true });
+    }
+  });
+
+  it("S4: watcher SIGKILLed while tmux alive → watcher respawned, broker stays up", async () => {
+    const socketName = nextSocketName();
+    const runtimeDir = makeRuntimeDir("s4");
+
+    const seeded = spawnSync("tmux", ["-L", socketName, "new-session", "-d", "-s", "seed"], {
+      encoding: "utf8",
+      timeout: 10_000,
+    });
+    assert.equal(seeded.status, 0, `tmux new-session failed: ${seeded.stderr}`);
+
+    const broker = createBroker({ socketName, runtimeDir, idleExitMs: 600_000 });
+    const exits: BrokerSelfExitReason[] = [];
+    broker.onSelfExit((reason) => exits.push(reason));
+    await broker.start();
+    const endpoint = broker.endpoint();
+
+    try {
+      await waitFor(() => findWatcherPids(socketName).length > 0, 5_000, "initial watcher attach");
+      const pid1 = findWatcherPids(socketName)[0]!;
+
+      // Kill ONLY the watcher process; the tmux server stays alive.
+      process.kill(pid1, "SIGKILL");
+
+      // The broker must probe (tmux alive) and respawn a fresh watcher —
+      // and must NOT exit.
+      await waitFor(
+        () => findWatcherPids(socketName).some((p) => p !== pid1),
+        5_000,
+        "watcher respawn with a new pid",
+      );
+      assert.equal(exits.length, 0, "broker must NOT self-exit when only the watcher died");
+      assert.ok(fs.existsSync(endpoint), "broker socket must still exist");
+
+      // Broker must still be serving: a fresh client can connect.
+      const t = await connectSocketTransport(endpoint);
+      await waitFor(() => broker.connectedClientCount === 1, 2_000, "broker still accepts clients");
+      t.close();
+      await waitFor(() => broker.connectedClientCount === 0, 2_000, "client disconnect observed");
+
+      // The RESPAWNED watcher must still drive the tmux-death exit path.
+      spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
+      await waitFor(() => exits.length > 0, 2_000, "self-exit via respawned watcher");
+      assert.deepEqual(exits, ["tmux-gone"]);
+      assert.equal(fs.existsSync(endpoint), false, "socket file must be unlinked on self-exit");
+    } finally {
+      await broker.shutdown(); // idempotent after self-exit
+      spawnSync("tmux", ["-L", socketName, "kill-server"], { stdio: "ignore", timeout: 5_000 });
+      fs.rmSync(runtimeDir, { recursive: true, force: true });
     }
   });
 });

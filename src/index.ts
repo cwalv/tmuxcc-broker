@@ -11,16 +11,18 @@
  *
  * See SCHEMA.md "Broker wire" for the full wire protocol spec.
  *
- * Assumption on lifecycle supervision:
- * The broker does not manage its own auto-spawn or OS-level supervision —
- * (re)starting brokers is the launcher's concern.  Daemons need no external
- * supervision either: they are non-detached children that enforce
+ * Lifecycle (ext-a-design-context.md §6.2/§6.3): auto-spawn is the
+ * launcher's job, but the broker self-manages exit (tc-3iv) — immediate
+ * self-exit when tmux is confirmed gone (watcher EOF + failed probe),
+ * 5-minute hysteresis self-exit at zero IPC clients.  Both paths unlink the
+ * broker socket file before `onSelfExit` listeners run.  Daemons need no
+ * external supervision either: they are non-detached children that enforce
  * die-with-parent themselves (tc-2c5), so a dead broker leaves no orphans;
  * a fresh broker simply spawns fresh daemons against the surviving tmux state.
  */
 
 export { createBroker } from "./broker.js";
-export type { BrokerHandle, BrokerOptions } from "./broker.js";
+export type { BrokerHandle, BrokerOptions, BrokerSelfExitReason } from "./broker.js";
 
 // Socket transport utilities (useful for clients / tests)
 export { createSocketTransport, connectSocketTransport, createSocketServer } from "./socket-transport.js";

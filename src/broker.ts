@@ -18,6 +18,10 @@
  *   3. A session table mapping session names → { sessionId, tmuxId, ... }
  *   4. A daemon supervisor that spawns/reaps per-session daemon child processes
  *   5. A set of connected client transports (fan-out for delta messages)
+ *   6. Its own exit policy (tc-3iv, ext-a-design-context.md §6.2): immediate
+ *      self-exit when tmux is confirmed gone (watcher EOF + failed `tmux ls`
+ *      probe), and a 5-minute hysteresis self-exit at zero IPC clients.  Both
+ *      paths unlink the broker socket file before reporting exit.
  *
  * # Wire protocol (Broker wire)
  *
@@ -62,7 +66,8 @@ import type {
 
 import { createSocketServer, createSocketTransport } from "./socket-transport.js";
 import { brokerSocketPath, daemonSocketPath, removeSocket, restrictSocket } from "./runtime-dir.js";
-import { listSessions, createSession, killSession, createTmuxWatcher, setWindowSynchronizePanes, setWindowMonitorActivity, setWindowMonitorSilence, setSessionMarker } from "./tmux-south.js";
+import { listSessions, createSession, killSession, createTmuxWatcher, probeTmuxAlive, setWindowSynchronizePanes, setWindowMonitorActivity, setWindowMonitorSilence, setSessionMarker } from "./tmux-south.js";
+import type { TmuxWatcher } from "./tmux-south.js";
 import { createDaemonSupervisor } from "./daemon-supervisor.js";
 import type { DaemonSupervisor } from "./daemon-supervisor.js";
 import type { RuntimeDirOptions } from "./runtime-dir.js";
@@ -84,7 +89,23 @@ export interface BrokerOptions {
    * Default: $XDG_RUNTIME_DIR/tmuxcc or /tmp/tmuxcc-<uid>.
    */
   runtimeDir?: string;
+
+  /**
+   * Idle self-exit hysteresis (tc-3iv, §6.2): when the broker has had zero
+   * IPC clients for this long, it self-exits.  Default 5 minutes — sized for
+   * human-scale close+reopen workflows (reload-window gaps are sub-second).
+   * Tests inject a short value instead of literally waiting 5 minutes.
+   */
+  idleExitMs?: number;
 }
+
+/**
+ * Why the broker self-exited (tc-3iv, §6.2):
+ *   - "tmux-gone": the thin `-CC` watcher EOFed AND the `tmux ls` probe
+ *     confirmed the tmux server is gone.
+ *   - "idle": zero IPC clients for the full hysteresis window.
+ */
+export type BrokerSelfExitReason = "tmux-gone" | "idle";
 
 /** The broker handle returned by createBroker. */
 export interface BrokerHandle {
@@ -104,6 +125,34 @@ export interface BrokerHandle {
    * The broker's unix socket path. Only valid after start() resolves.
    */
   endpoint(): string;
+
+  // ── tc-3iv self-exit lifecycle (§6.2) ──────────────────────────────────────
+
+  /**
+   * Number of currently open IPC connections to the broker socket.
+   *
+   * "Client" means any open Unix-domain socket connection — counted at the
+   * raw socket level, before (and regardless of) the wire handshake.  It does
+   * NOT mean "has bound a terminal" or "has claimed a session"; a
+   * connected-but-idle client keeps the broker alive.
+   */
+  readonly connectedClientCount: number;
+
+  /**
+   * Register a callback invoked after the broker has self-exited: shutdown is
+   * complete and the broker socket file is already unlinked when the callback
+   * runs.  The entry point wires this to `process.exit(0)`.
+   *
+   * Self-exit triggers (§6.2):
+   *   - The thin `-CC` watcher EOFs and the 1 s `tmux ls` probe fails
+   *     (tmux genuinely gone) → immediate exit, reason "tmux-gone".
+   *   - Zero IPC clients for `idleExitMs` (default 5 min) → reason "idle".
+   *
+   * If the watcher EOFs but the probe succeeds (the watcher process itself
+   * was killed while tmux lives), the broker re-spawns the watcher and does
+   * NOT exit.
+   */
+  onSelfExit(cb: (reason: BrokerSelfExitReason) => void): void;
 
   /**
    * Toggle `synchronize-panes` for a tmux window (tc-7xv.12).
@@ -190,6 +239,26 @@ const BROKER_CAPABILITIES: Capabilities = {
 };
 
 // ---------------------------------------------------------------------------
+// Self-exit policy constants (tc-3iv, §6.2)
+// ---------------------------------------------------------------------------
+
+/** Default idle (zero IPC clients) self-exit hysteresis: 5 minutes. */
+const DEFAULT_IDLE_EXIT_MS = 5 * 60_000;
+
+/** Timeout for the `tmux ls` liveness probe after a watcher EOF. */
+const TMUX_PROBE_TIMEOUT_MS = 1_000;
+
+/**
+ * Watcher respawn backoff (probe-succeeded path).  A watcher that lived at
+ * least WATCHER_HEALTHY_MS is respawned immediately (one-off signal/OOM kill);
+ * short-lived watchers escalate 250 ms → 8 s so a persistently-failing spawn
+ * (e.g. broken PTY bridge) cannot turn into a process-spawn storm.
+ */
+const WATCHER_HEALTHY_MS = 10_000;
+const WATCHER_RESPAWN_BACKOFF_INIT_MS = 250;
+const WATCHER_RESPAWN_BACKOFF_MAX_MS = 8_000;
+
+// ---------------------------------------------------------------------------
 // BrokerImpl
 // ---------------------------------------------------------------------------
 
@@ -212,10 +281,29 @@ class BrokerImpl implements BrokerHandle {
   private _byName = new Map<string, SessionEntry>();
 
   private _supervisor: DaemonSupervisor = createDaemonSupervisor();
-  private _watcher: ReturnType<typeof createTmuxWatcher> | null = null;
+  private _watcher: TmuxWatcher | null = null;
   private _server: { close(): Promise<void> } | null = null;
   private _socketPath: string = "";
   private _started = false;
+
+  // ── tc-3iv self-exit state ──────────────────────────────────────────────────
+  /** Idle hysteresis window (ms) before self-exit at zero IPC clients. */
+  private readonly _idleExitMs: number;
+  /** Raw IPC connection count, maintained by the socket server (§6.2 "client"). */
+  private _ipcClientCount = 0;
+  /** Pending idle self-exit timer; armed whenever the client count is zero. */
+  private _idleTimer: ReturnType<typeof setTimeout> | null = null;
+  /** Set once a self-exit has been initiated; suppresses re-entry. */
+  private _selfExited = false;
+  /** True while a watcher-EOF tmux probe is in flight. */
+  private _probeInFlight = false;
+  private _selfExitHandlers: Array<(reason: BrokerSelfExitReason) => void> = [];
+  /** When the current watcher was spawned (drives respawn backoff). */
+  private _watcherSpawnedAt = 0;
+  /** Backoff for the next respawn after a short-lived watcher. 0 = immediate. */
+  private _watcherRespawnDelayMs = 0;
+  /** Pending watcher respawn timer (probe-succeeded path). */
+  private _respawnTimer: ReturnType<typeof setTimeout> | null = null;
 
   /**
    * Per-name claim locks: maps session name → in-flight claim promise.
@@ -227,11 +315,20 @@ class BrokerImpl implements BrokerHandle {
     this._opts = opts;
     this._socketDirName = opts.socketName;
     this._runtimeDirOpts = opts.runtimeDir !== undefined ? { runtimeDir: opts.runtimeDir } : {};
+    this._idleExitMs = opts.idleExitMs ?? DEFAULT_IDLE_EXIT_MS;
   }
 
   endpoint(): string {
     if (!this._started) throw new Error("Broker not started");
     return this._socketPath;
+  }
+
+  get connectedClientCount(): number {
+    return this._ipcClientCount;
+  }
+
+  onSelfExit(cb: (reason: BrokerSelfExitReason) => void): void {
+    this._selfExitHandlers.push(cb);
   }
 
   /**
@@ -293,16 +390,26 @@ class BrokerImpl implements BrokerHandle {
 
   async start(): Promise<void> {
     if (this._started) throw new Error("Broker already started");
+    this._selfExited = false;
 
     this._socketPath = brokerSocketPath(this._socketDirName, this._runtimeDirOpts);
 
     // Remove stale socket file if present
     removeSocket(this._socketPath);
 
-    // Start the unix socket server
-    this._server = await createSocketServer(this._socketPath, (transport) => {
-      void this._handleConnection(transport);
-    });
+    // Start the unix socket server.  Connection counting happens at the raw
+    // socket level (see SocketServerOptions.onConnectionCountChange).
+    this._server = await createSocketServer(
+      this._socketPath,
+      (transport) => {
+        void this._handleConnection(transport);
+      },
+      {
+        onConnectionCountChange: (count) => {
+          this._onConnectionCountChange(count);
+        },
+      },
+    );
 
     // Restrict socket permissions to 0600
     restrictSocket(this._socketPath);
@@ -311,9 +418,7 @@ class BrokerImpl implements BrokerHandle {
     this._refreshSessions();
 
     // Start tmux watcher for %sessions-changed notifications
-    this._watcher = createTmuxWatcher(this._opts.socketName, () => {
-      this._refreshSessions();
-    });
+    this._watcher = this._spawnWatcher();
 
     // Wire supervisor crash handler
     this._supervisor.onCrash((sessionId) => {
@@ -327,9 +432,19 @@ class BrokerImpl implements BrokerHandle {
     });
 
     this._started = true;
+
+    // Arm the idle-exit hysteresis: the broker starts with zero clients, and
+    // a launcher that crashes before connecting must not leak a broker.
+    this._startIdleTimer();
   }
 
   async shutdown(): Promise<void> {
+    this._clearIdleTimer();
+    if (this._respawnTimer !== null) {
+      clearTimeout(this._respawnTimer);
+      this._respawnTimer = null;
+    }
+
     this._watcher?.stop();
     this._watcher = null;
 
@@ -350,6 +465,132 @@ class BrokerImpl implements BrokerHandle {
     removeSocket(this._socketPath);
 
     this._started = false;
+  }
+
+  // ---------------------------------------------------------------------------
+  // Self-exit policy (tc-3iv, §6.2)
+  // ---------------------------------------------------------------------------
+
+  private _spawnWatcher(): TmuxWatcher {
+    this._watcherSpawnedAt = Date.now();
+    return createTmuxWatcher(
+      this._opts.socketName,
+      () => {
+        this._refreshSessions();
+      },
+      () => {
+        this._onWatcherEof();
+      },
+    );
+  }
+
+  /**
+   * The thin `-CC` watcher EOFed.  Disambiguate via a `tmux ls` probe (1 s
+   * timeout): probe fails → tmux genuinely gone → self-exit immediately;
+   * probe succeeds → the watcher process itself died (signal/OOM) while tmux
+   * lives → re-spawn the watcher and keep serving.
+   */
+  private _onWatcherEof(): void {
+    if (!this._started || this._selfExited || this._probeInFlight) return;
+    this._probeInFlight = true;
+
+    void probeTmuxAlive(this._opts.socketName, TMUX_PROBE_TIMEOUT_MS).then((alive) => {
+      this._probeInFlight = false;
+      // The broker may have been shut down (or self-exited) during the probe.
+      if (!this._started || this._selfExited) return;
+
+      if (alive) {
+        // Watcher died but tmux lives — re-spawn, with backoff if the watcher
+        // keeps dying young (see WATCHER_HEALTHY_MS).
+        const aliveMs = Date.now() - this._watcherSpawnedAt;
+        if (aliveMs >= WATCHER_HEALTHY_MS) {
+          this._watcherRespawnDelayMs = 0;
+        } else {
+          this._watcherRespawnDelayMs = Math.min(
+            Math.max(this._watcherRespawnDelayMs * 2, WATCHER_RESPAWN_BACKOFF_INIT_MS),
+            WATCHER_RESPAWN_BACKOFF_MAX_MS,
+          );
+        }
+        this._scheduleWatcherRespawn(this._watcherRespawnDelayMs);
+      } else {
+        void this._selfExit("tmux-gone");
+      }
+    });
+  }
+
+  private _scheduleWatcherRespawn(delayMs: number): void {
+    if (this._respawnTimer !== null) return; // already scheduled
+    const timer = setTimeout(() => {
+      this._respawnTimer = null;
+      if (!this._started || this._selfExited) return;
+      // Replace the (inert, already-EOFed) watcher and force a refresh:
+      // sessions may have changed during the watcher gap.
+      this._watcher?.stop();
+      this._watcher = this._spawnWatcher();
+      this._refreshSessions();
+    }, delayMs);
+    timer.unref();
+    this._respawnTimer = timer;
+  }
+
+  /** Socket-level connection count changed (raw connections, pre-handshake). */
+  private _onConnectionCountChange(count: number): void {
+    this._ipcClientCount = count;
+    if (!this._started || this._selfExited) return;
+    if (count === 0) {
+      // Last client gone — restart the hysteresis window.
+      this._startIdleTimer();
+    } else {
+      this._clearIdleTimer();
+    }
+  }
+
+  private _startIdleTimer(): void {
+    this._clearIdleTimer();
+    const timer = setTimeout(() => {
+      this._idleTimer = null;
+      if (this._started && !this._selfExited && this._ipcClientCount === 0) {
+        void this._selfExit("idle");
+      }
+    }, this._idleExitMs);
+    // The listening server keeps the event loop alive while the broker runs;
+    // unref so a pending hysteresis window never holds the loop on its own.
+    timer.unref();
+    this._idleTimer = timer;
+  }
+
+  private _clearIdleTimer(): void {
+    if (this._idleTimer !== null) {
+      clearTimeout(this._idleTimer);
+      this._idleTimer = null;
+    }
+  }
+
+  /**
+   * Self-exit: run a full shutdown (which unlinks the broker socket file —
+   * required so the next launcher's probe doesn't get connect-then-reset),
+   * then notify onSelfExit listeners.  The entry point maps that notification
+   * to `process.exit(0)`.
+   */
+  private async _selfExit(reason: BrokerSelfExitReason): Promise<void> {
+    if (this._selfExited || !this._started) return;
+    this._selfExited = true;
+
+    try {
+      await this.shutdown();
+    } catch {
+      // Best-effort: even if shutdown failed midway, the socket file MUST be
+      // gone before we report self-exit, or the next spawn stalls.
+      removeSocket(this._socketPath);
+    }
+
+    for (const cb of this._selfExitHandlers.slice()) {
+      try {
+        cb(reason);
+      } catch {
+        // Listener errors must not break the exit path
+      }
+    }
   }
 
   // ---------------------------------------------------------------------------
@@ -790,15 +1031,20 @@ function errorCode(err: unknown): string {
  * await broker.shutdown();
  * ```
  *
- * Assumption on broker lifecycle supervision:
- * The broker does not manage its own auto-spawn or OS-level supervision —
- * when/how a broker is (re)started is the launcher's concern.  Per SCHEMA.md
- * "Broker lifecycle" there are no orphaned daemons to reap after a broker
- * crash: daemons are non-detached children that enforce die-with-parent
- * themselves (tc-2c5 — getppid watchdog installed in daemon-entry.ts), so a
- * dead broker never leaves serving orphans.  Recovery is launcher → fresh
- * broker → fresh daemons on next session.claim → fresh `-CC attach` to the
- * surviving tmux sessions.
+ * Lifecycle (tc-3iv, §6.2): the broker does not manage its own auto-spawn —
+ * that is the launcher's job — but it DOES self-manage exit:
+ *   - watcher EOF + failed 1 s `tmux ls` probe → immediate self-exit
+ *     (tmux genuinely gone; mirrors tmux's own `exit-empty on` semantics)
+ *   - watcher EOF + successful probe → re-spawn the watcher, keep serving
+ *   - zero IPC clients for `idleExitMs` (default 5 min) → self-exit
+ * Register `onSelfExit` to observe; both paths complete shutdown() — which
+ * unlinks the broker socket file — before listeners run.  There is no
+ * auto-restart layer: broker crashes are bugs to fix, not UX to smooth over.
+ * Nor are there orphaned daemons to reap after a broker crash: daemons are
+ * non-detached children that enforce die-with-parent themselves (tc-2c5 —
+ * getppid watchdog installed in daemon-entry.ts).  Recovery is launcher →
+ * fresh broker → fresh daemons on next session.claim → fresh `-CC attach`
+ * to the surviving tmux sessions.
  */
 export function createBroker(opts: BrokerOptions): BrokerHandle {
   return new BrokerImpl(opts);
